@@ -579,11 +579,11 @@ pub async fn restore_worktree_via_git(
     // every messy intermediate state into one clean flow:
     //
     //   - Directory missing, no registration:           plain add.
-    //   - Directory missing, stale registration:        prune → add.
+    //   - Directory missing, stale registration:        scoped remove → add.
     //   - Directory leftover, no registration
     //     (the original Windows file-lock bug):         delete → add.
-    //   - Directory leftover, stale registration:       delete → prune → add.
-    //   - Directory exists as a fully valid worktree:   delete → prune → add.
+    //   - Directory leftover, stale registration:       delete → scoped remove → add.
+    //   - Directory exists as a fully valid worktree:   delete → scoped remove → add.
     //
     // Deleting first is safe because the caller is required to gate user
     // content behind a confirmation prompt (see `worktree_path_has_content`),
@@ -615,14 +615,31 @@ pub async fn restore_worktree_via_git(
         })?;
     }
 
-    // Prune any stale registration in the main repo that points at the (now
-    // missing) worktree path. Without this, `git worktree add` would fail
-    // with "already assigned but missing". Idempotent when nothing is stale.
-    let prune_rx = main_repo.update(cx, |repo, _cx| repo.prune_worktrees());
-    prune_rx
+    // Clean up any stale registration in the main repo that points at the
+    // (now missing) worktree path. Without this, `git worktree add` would
+    // fail with "already assigned but missing".
+    //
+    // We call `git worktree remove --force` scoped to this exact path
+    // rather than `git worktree prune`, which would have the side effect
+    // of dropping admin entries for *other* unrelated worktrees whose
+    // working directories happen to be missing. If there is no
+    // registration to remove, `git worktree remove` exits with "is not a
+    // working tree"; we treat that as a successful no-op since the
+    // subsequent `git worktree add` will surface any real configuration
+    // problem on its own.
+    let remove_rx = main_repo.update(cx, |repo, _cx| {
+        repo.remove_worktree(worktree_path.clone(), true)
+    });
+    if let Err(error) = remove_rx
         .await
-        .map_err(|_| anyhow!("worktree prune was canceled"))?
-        .context("failed to prune stale worktree registrations")?;
+        .map_err(|_| anyhow!("worktree remove was canceled"))
+        .and_then(|r| r)
+    {
+        log::debug!(
+            "git worktree remove --force for '{}' failed (likely no stale registration): {error:#}",
+            worktree_path.display()
+        );
+    }
 
     // Create the worktree at the original commit — the branch still points
     // here because archival used detached commits.
