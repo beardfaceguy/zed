@@ -2921,32 +2921,46 @@ impl Sidebar {
                         "Restoring this thread will overwrite the existing contents of:\n\n{}\n\nContinue?",
                         paths_for_prompt.join("\n")
                     );
-                    let answer = cx
+                    let prompt_result = cx
                         .prompt(
                             gpui::PromptLevel::Warning,
                             &prompt_message,
                             None,
                             &["Overwrite", "Cancel"],
                         )
-                        .await
-                        .ok();
+                        .await;
 
-                    if answer != Some(0) {
-                        // User canceled. No destructive work has been done
-                        // yet (the pre-flight pass is read-only), so just
-                        // clean up UI state and return.
-                        this.update_in(cx, |this, _window, cx| {
-                            this.restoring_tasks.remove(&thread_id);
-                            if let Some(weak_archive_view) = &weak_archive_view {
-                                weak_archive_view
-                                    .update(cx, |view, cx| {
-                                        view.clear_restoring(&thread_id, cx);
-                                    })
-                                    .ok();
+                    match prompt_result {
+                        Ok(0) => {
+                            // User confirmed overwrite; fall through to the
+                            // restore pass below.
+                        }
+                        Ok(_) | Err(_) => {
+                            // Either the user canceled, or the prompt failed
+                            // (e.g. the window closed mid-prompt). Either
+                            // way, no destructive work has been done yet —
+                            // the pre-flight pass is read-only — so we just
+                            // clean up UI state and bail. We treat a prompt
+                            // failure as if the user had canceled, but log
+                            // it so the failure isn't invisible.
+                            if let Err(error) = &prompt_result {
+                                log::error!(
+                                    "Failed to prompt for overwrite confirmation: {error:#}"
+                                );
                             }
-                        })
-                        .ok();
-                        return anyhow::Ok(());
+                            this.update_in(cx, |this, _window, cx| {
+                                this.restoring_tasks.remove(&thread_id);
+                                if let Some(weak_archive_view) = &weak_archive_view {
+                                    weak_archive_view
+                                        .update(cx, |view, cx| {
+                                            view.clear_restoring(&thread_id, cx);
+                                        })
+                                        .ok();
+                                }
+                            })
+                            .ok();
+                            return anyhow::Ok(());
+                        }
                     }
                 }
 
