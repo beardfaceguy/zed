@@ -5437,7 +5437,7 @@ async fn test_restore_worktree_cleans_up_backup_on_success(cx: &mut TestAppConte
     let leftover_backup = fs.directories(true).into_iter().find(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+            .is_some_and(|name| name.starts_with("zed-restore-backup-"))
     });
     assert!(
         leftover_backup.is_none(),
@@ -5571,7 +5571,7 @@ async fn test_restore_worktree_rolls_back_backup_on_failure(cx: &mut TestAppCont
     let leftover_backup = fs.directories(true).into_iter().find(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+            .is_some_and(|name| name.starts_with("zed-restore-backup-"))
     });
     assert!(
         leftover_backup.is_none(),
@@ -5770,7 +5770,7 @@ async fn test_restore_worktree_round_trips_committed_and_uncommitted_content(
     let leftover_backup = fs.directories(true).into_iter().find(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+            .is_some_and(|name| name.starts_with("zed-restore-backup-"))
     });
     assert!(
         leftover_backup.is_none(),
@@ -5905,7 +5905,7 @@ async fn test_restore_worktree_rolls_back_when_create_worktree_detached_fails(
     let leftover_backup = fs.directories(true).into_iter().find(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+            .is_some_and(|name| name.starts_with("zed-restore-backup-"))
     });
     assert!(
         leftover_backup.is_none(),

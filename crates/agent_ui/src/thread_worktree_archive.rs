@@ -561,7 +561,7 @@ pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &m
 /// **Destructive**: the final step (`restore_archive_checkpoint`) clobbers the
 /// working directory unconditionally via `git read-tree --reset -u`. Any
 /// pre-existing entry at `worktree_path` is moved aside into a sibling
-/// `.zed-restore-backup-<uuid>` directory before the rest of the destructive
+/// `zed-restore-backup-<uuid>` directory before the rest of the destructive
 /// work runs. If a later step fails, the backup is moved back over
 /// `worktree_path` so the user does not lose their content. On success the
 /// backup directory is deleted. Callers must still use
@@ -607,7 +607,7 @@ pub async fn restore_worktree_via_git(
                 worktree_path.display()
             )
         })?;
-        let backup_dir = parent.join(format!(".zed-restore-backup-{}", uuid::Uuid::new_v4()));
+        let backup_dir = parent.join(format!("zed-restore-backup-{}", uuid::Uuid::new_v4()));
         app_state
             .fs
             .create_dir(&backup_dir)
@@ -875,6 +875,23 @@ async fn rollback_backup(
     let Some(backup) = backup else {
         return;
     };
+    // Force-clear the destination so `rename` won't fail with ENOTEMPTY
+    // if `remove_new_worktree_on_error` left a partial directory behind.
+    if let Err(clear_error) = fs
+        .remove_dir(
+            worktree_path,
+            RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: true,
+            },
+        )
+        .await
+    {
+        log::warn!(
+            "failed to clear '{}' before rollback rename: {clear_error:#}",
+            worktree_path.display()
+        );
+    }
     if let Err(rollback_error) = fs
         .rename(
             &backup.target,

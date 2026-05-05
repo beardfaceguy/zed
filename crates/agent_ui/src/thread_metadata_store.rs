@@ -491,15 +491,23 @@ pub struct RestoreGuard {
 
 impl Drop for RestoreGuard {
     fn drop(&mut self) {
-        // `WeakEntity::update` returns an error if the entity has been
-        // released; that's fine — there's nothing to release in that case.
-        // We deliberately don't propagate the error: drops can run on any
-        // exit path and there's no caller to surface it to.
-        self.store
-            .update(&mut self.cx, |store, _| {
-                store.finish_restoring(self.thread_id);
+        // Spawn a detached task instead of updating synchronously, because
+        // this guard may be dropped while GPUI's application state is already
+        // mutably borrowed (e.g. during an entity update that drops a task
+        // holding the guard). A synchronous `WeakEntity::update` would
+        // re-enter `App::borrow_mut()` and panic with `BorrowMutError`.
+        let store = self.store.clone();
+        let thread_id = self.thread_id;
+        let mut cx = self.cx.clone();
+        self.cx
+            .spawn(async move |_| {
+                store
+                    .update(&mut cx, |store, _| {
+                        store.finish_restoring(thread_id);
+                    })
+                    .ok();
             })
-            .ok();
+            .detach();
     }
 }
 
