@@ -923,22 +923,42 @@ async fn rollback_backup(
     let Some(backup) = backup else {
         return;
     };
-    // Force-clear the destination so `rename` won't fail with ENOTEMPTY
-    // if `remove_new_worktree_on_error` left a partial directory behind.
-    if let Err(clear_error) = fs
-        .remove_dir(
-            worktree_path,
-            RemoveOptions {
-                recursive: true,
-                ignore_if_not_exists: true,
-            },
-        )
-        .await
-    {
-        log::warn!(
-            "failed to clear '{}' before rollback rename: {clear_error:#}",
-            worktree_path.display()
-        );
+    if let Ok(Some(metadata)) = fs.metadata(worktree_path).await {
+        let is_empty_dir = if metadata.is_dir {
+            use futures::stream::StreamExt as _;
+            match fs.read_dir(worktree_path).await {
+                Ok(mut entries) => entries.next().await.is_none(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        if is_empty_dir {
+            if let Err(clear_error) = fs
+                .remove_dir(
+                    worktree_path,
+                    RemoveOptions {
+                        recursive: false,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await
+            {
+                log::warn!(
+                    "failed to clear empty '{}' before rollback rename: {clear_error:#}",
+                    worktree_path.display()
+                );
+            }
+        } else {
+            log::error!(
+                "cannot rollback: '{}' has unexpected content after restore failure; \
+                 original error: {original_error:#}; \
+                 user's pre-existing content remains at '{}' for manual recovery",
+                worktree_path.display(),
+                backup.target.display(),
+            );
+            return;
+        }
     }
     if let Err(rollback_error) = fs
         .rename(
