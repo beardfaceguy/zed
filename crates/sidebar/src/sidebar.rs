@@ -2721,6 +2721,22 @@ impl Sidebar {
         })
     }
 
+    fn finish_restore_ui(
+        &mut self,
+        thread_id: agent_ui::ThreadId,
+        weak_archive_view: &Option<WeakEntity<ThreadsArchiveView>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.restoring_tasks.remove(&thread_id);
+        if let Some(weak_archive_view) = weak_archive_view {
+            weak_archive_view
+                .update(cx, |view, cx| {
+                    view.clear_restoring(&thread_id, cx);
+                })
+                .ok();
+        }
+    }
+
     fn open_thread_from_archive(
         &mut self,
         metadata: ThreadMetadata,
@@ -2792,14 +2808,7 @@ impl Sidebar {
                     Some(guard) => guard,
                     None => {
                         this.update_in(cx, |this, _window, cx| {
-                            this.restoring_tasks.remove(&thread_id);
-                            if let Some(weak_archive_view) = &weak_archive_view {
-                                weak_archive_view
-                                    .update(cx, |view, cx| {
-                                        view.clear_restoring(&thread_id, cx);
-                                    })
-                                    .ok();
-                            }
+                            this.finish_restore_ui(thread_id, &weak_archive_view, cx);
 
                             if let Some(multi_workspace) = this.multi_workspace.upgrade() {
                                 let workspace = multi_workspace.read(cx).workspace().clone();
@@ -2880,14 +2889,7 @@ impl Sidebar {
                                 "Failed to check worktree path for existing content: {error:#}"
                             );
                             this.update_in(cx, |this, _window, cx| {
-                                this.restoring_tasks.remove(&thread_id);
-                                if let Some(weak_archive_view) = &weak_archive_view {
-                                    weak_archive_view
-                                        .update(cx, |view, cx| {
-                                            view.clear_restoring(&thread_id, cx);
-                                        })
-                                        .ok();
-                                }
+                                this.finish_restore_ui(thread_id, &weak_archive_view, cx);
 
                                 if let Some(multi_workspace) = this.multi_workspace.upgrade() {
                                     let workspace = multi_workspace.read(cx).workspace().clone();
@@ -2954,14 +2956,7 @@ impl Sidebar {
                                 );
                             }
                             this.update_in(cx, |this, _window, cx| {
-                                this.restoring_tasks.remove(&thread_id);
-                                if let Some(weak_archive_view) = &weak_archive_view {
-                                    weak_archive_view
-                                        .update(cx, |view, cx| {
-                                            view.clear_restoring(&thread_id, cx);
-                                        })
-                                        .ok();
-                                }
+                                this.finish_restore_ui(thread_id, &weak_archive_view, cx);
                             })
                             .ok();
                             return anyhow::Ok(());
@@ -2999,14 +2994,7 @@ impl Sidebar {
                         Err(error) => {
                             log::error!("Failed to restore worktree: {error:#}");
                             this.update_in(cx, |this, _window, cx| {
-                                this.restoring_tasks.remove(&thread_id);
-                                if let Some(weak_archive_view) = &weak_archive_view {
-                                    weak_archive_view
-                                        .update(cx, |view, cx| {
-                                            view.clear_restoring(&thread_id, cx);
-                                        })
-                                        .ok();
-                                }
+                                this.finish_restore_ui(thread_id, &weak_archive_view, cx);
 
                                 if let Some(multi_workspace) = this.multi_workspace.upgrade() {
                                     let workspace = multi_workspace.read(cx).workspace().clone();
@@ -3073,14 +3061,7 @@ impl Sidebar {
             if let Err(error) = result {
                 log::error!("{error:#}");
                 this.update_in(cx, |this, _window, cx| {
-                    this.restoring_tasks.remove(&thread_id);
-                    if let Some(weak_archive_view) = &weak_archive_view {
-                        weak_archive_view
-                            .update(cx, |view, cx| {
-                                view.clear_restoring(&thread_id, cx);
-                            })
-                            .ok();
-                    }
+                    this.finish_restore_ui(thread_id, &weak_archive_view, cx);
 
                     if let Some(multi_workspace) = this.multi_workspace.upgrade() {
                         let workspace = multi_workspace.read(cx).workspace().clone();
