@@ -18,6 +18,17 @@ use workspace::{AppState, MultiWorkspace, Workspace};
 
 use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadId, ThreadMetadataStore};
 
+/// Controls whether [`restore_worktree_via_git`] should proceed when
+/// pre-existing content is found at the worktree path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverwritePolicy {
+    /// Return an error if the worktree path has content, without doing
+    /// any destructive work. Callers use this for a read-only preflight.
+    Refuse,
+    /// Move pre-existing content to a backup and proceed with the restore.
+    Overwrite,
+}
+
 /// The plan for archiving a single git worktree root.
 ///
 /// A thread can have multiple folder paths open, so there may be multiple
@@ -564,12 +575,19 @@ pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &m
 /// `zed-restore-backup-<uuid>` directory before the rest of the destructive
 /// work runs. If a later step fails, the backup is moved back over
 /// `worktree_path` so the user does not lose their content. On success the
-/// backup directory is deleted. Callers must still use
-/// [`worktree_path_has_content`] first to detect any content the user might
-/// overwrite, and prompt for confirmation before invoking this function.
+/// backup directory is deleted.
+///
+/// The `overwrite_policy` parameter controls behaviour when pre-existing
+/// content is found at `worktree_path`:
+///
+/// * [`OverwritePolicy::Refuse`] — returns an error without doing any
+///   destructive work, suitable for a preflight check.
+/// * [`OverwritePolicy::Overwrite`] — moves the content to a backup and
+///   proceeds with the restore.
 pub async fn restore_worktree_via_git(
     row: &ArchivedGitWorktree,
     remote_connection: Option<&RemoteConnectionOptions>,
+    overwrite_policy: OverwritePolicy,
     cx: &mut AsyncApp,
 ) -> Result<PathBuf> {
     if remote_connection.is_some() {
@@ -598,7 +616,19 @@ pub async fn restore_worktree_via_git(
     // confirmed they wanted overwritten only on the assumption that the
     // archived state would replace it. On success the backup is deleted at
     // the end of this function.
-    let backup = if app_state.fs.metadata(worktree_path).await?.is_some() {
+    let path_exists = app_state.fs.metadata(worktree_path).await?.is_some();
+
+    if path_exists
+        && overwrite_policy == OverwritePolicy::Refuse
+        && worktree_path_has_content(app_state.fs.as_ref(), worktree_path).await?
+    {
+        anyhow::bail!(
+            "worktree path '{}' has existing content; use OverwritePolicy::Overwrite to proceed",
+            worktree_path.display()
+        );
+    }
+
+    let backup = if path_exists {
         // Place the backup directory next to `worktree_path` so the rename
         // stays on the same filesystem and is therefore atomic. If the
         // worktree path has no parent (e.g. it is the filesystem root),

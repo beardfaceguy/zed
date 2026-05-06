@@ -5109,6 +5109,7 @@ async fn test_restore_worktree_when_branch_has_moved(cx: &mut TestAppContext) {
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5218,6 +5219,7 @@ async fn test_restore_worktree_when_branch_has_not_moved(cx: &mut TestAppContext
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5319,6 +5321,7 @@ async fn test_restore_worktree_when_branch_does_not_exist(cx: &mut TestAppContex
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5425,6 +5428,7 @@ async fn test_restore_worktree_cleans_up_backup_on_success(cx: &mut TestAppConte
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5545,6 +5549,7 @@ async fn test_restore_worktree_rolls_back_backup_on_failure(cx: &mut TestAppCont
                         original_commit_hash: "original-sha".to_string(),
                     },
                     None,
+                    agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                     &mut cx,
                 )
                 .await
@@ -5727,6 +5732,7 @@ async fn test_restore_worktree_round_trips_committed_and_uncommitted_content(
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5880,6 +5886,7 @@ async fn test_restore_worktree_rolls_back_when_create_worktree_detached_fails(
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await

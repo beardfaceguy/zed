@@ -2968,9 +2968,16 @@ impl Sidebar {
                 // confirm). Do the destructive restore for every worktree.
                 let mut path_replacements: Vec<(PathBuf, PathBuf)> = Vec::new();
                 for row in &archived_worktrees {
+                    let overwrite_policy =
+                        if paths_to_overwrite.contains(&row.worktree_path) {
+                            thread_worktree_archive::OverwritePolicy::Overwrite
+                        } else {
+                            thread_worktree_archive::OverwritePolicy::Refuse
+                        };
                     match thread_worktree_archive::restore_worktree_via_git(
                         row,
                         metadata.remote_connection.as_ref(),
+                        overwrite_policy,
                         &mut *cx,
                     )
                     .await
