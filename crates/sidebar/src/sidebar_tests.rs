@@ -5569,6 +5569,11 @@ async fn test_restore_worktree_rolls_back_backup_on_failure(cx: &mut TestAppCont
         result.is_err(),
         "restore should fail when checkpoint SHAs are bogus",
     );
+    let error_msg = format!("{:#}", result.as_ref().unwrap_err());
+    assert!(
+        error_msg.contains("failed to restore archive checkpoint"),
+        "error should indicate checkpoint failure, got: {error_msg}"
+    );
 
     // The pre-existing sentinel must be back at the original path.
     let sentinel_contents = fs
@@ -5904,6 +5909,12 @@ async fn test_restore_worktree_rolls_back_when_create_worktree_detached_fails(
     assert!(
         result.is_err(),
         "restore should fail when create_worktree_detached fails",
+    );
+    let error_msg = format!("{:#}", result.as_ref().unwrap_err());
+    assert!(
+        error_msg.contains("failed to create worktree")
+            || error_msg.contains("simulated create_worktree failure"),
+        "error should indicate worktree creation failure, got: {error_msg}"
     );
 
     // The pre-existing sentinel must be back at the original path.
