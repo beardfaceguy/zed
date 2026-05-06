@@ -1164,6 +1164,7 @@ mod tests {
     use git::repository::Worktree as GitWorktree;
     use gpui::{BorrowAppContext, TestAppContext};
     use project::Project;
+    use remote::SshConnectionOptions;
     use serde_json::json;
     use settings::SettingsStore;
     use workspace::MultiWorkspace;
@@ -1882,6 +1883,91 @@ mod tests {
             has_content.unwrap(),
             false,
             "empty dir must not report content"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_rejects_remote_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {
+                    "worktrees": {},
+                },
+                "src": {},
+            }),
+        )
+        .await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+        let remote_connection = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "test-host".into(),
+            ..Default::default()
+        });
+
+        let overwrite_row = ArchivedGitWorktree {
+            id: 1,
+            worktree_path: PathBuf::from("/remote/worktree"),
+            main_repo_path: PathBuf::from("/remote/project"),
+            branch_name: Some("feature".to_string()),
+            staged_commit_hash: "abc123".to_string(),
+            unstaged_commit_hash: "def456".to_string(),
+            original_commit_hash: "789abc".to_string(),
+        };
+
+        let overwrite_result = cx
+            .spawn(|mut cx| {
+                let remote_connection = remote_connection.clone();
+                async move {
+                    restore_would_overwrite(&overwrite_row, Some(&remote_connection), &mut cx).await
+                }
+            })
+            .await;
+
+        assert!(
+            overwrite_result.is_err(),
+            "restore_would_overwrite should reject remote connections"
+        );
+        assert!(
+            format!("{:#}", overwrite_result.unwrap_err()).contains("remote machines"),
+            "error message should mention remote machines"
+        );
+
+        let restore_row = ArchivedGitWorktree {
+            id: 1,
+            worktree_path: PathBuf::from("/remote/worktree"),
+            main_repo_path: PathBuf::from("/remote/project"),
+            branch_name: Some("feature".to_string()),
+            staged_commit_hash: "abc123".to_string(),
+            unstaged_commit_hash: "def456".to_string(),
+            original_commit_hash: "789abc".to_string(),
+        };
+
+        let restore_result = cx
+            .spawn(|mut cx| {
+                let remote_connection = remote_connection.clone();
+                async move {
+                    restore_worktree_via_git(
+                        &restore_row,
+                        Some(&remote_connection),
+                        OverwritePolicy::Overwrite,
+                        &mut cx,
+                    )
+                    .await
+                }
+            })
+            .await;
+
+        assert!(
+            restore_result.is_err(),
+            "restore_worktree_via_git should reject remote connections"
+        );
+        assert!(
+            format!("{:#}", restore_result.unwrap_err()).contains("remote machines"),
+            "error message should mention remote machines"
         );
     }
 }
