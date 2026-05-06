@@ -5457,6 +5457,14 @@ async fn test_restore_worktree_cleans_up_backup_on_success(cx: &mut TestAppConte
             .is_some(),
         "worktree path should exist after a successful restore"
     );
+
+    assert!(
+        fs.metadata(Path::new("/wt-feature-success/sentinel.txt"))
+            .await
+            .unwrap()
+            .is_none(),
+        "sentinel file from pre-existing content must not survive a successful restore"
+    );
 }
 
 #[gpui::test]
