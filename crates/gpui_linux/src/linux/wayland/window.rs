@@ -1532,7 +1532,7 @@ impl PlatformWindow for WaylandWindow {
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
         let a11y_active = self.borrow().a11y_active.clone();
         let a11y_active_for_activation = a11y_active.clone();
-        let a11y_active_for_deactivation = a11y_active.clone();
+        let a11y_active_for_deactivation = a11y_active;
 
         let activation_handler = TrivialActivationHandler {
             callback: callbacks.activation,
