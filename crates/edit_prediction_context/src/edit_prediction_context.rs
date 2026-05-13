@@ -22,8 +22,11 @@ use util::{RangeExt as _, ResultExt};
 mod assemble_excerpts;
 #[cfg(test)]
 mod edit_prediction_context_tests;
+mod editable_context;
 #[cfg(test)]
 mod fake_definition_lsp;
+
+pub use editable_context::{EditHistoryContextEntry, collect_editable_context};
 
 pub use zeta_prompt::{RelatedExcerpt, RelatedFile};
 
