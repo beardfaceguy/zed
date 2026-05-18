@@ -137,6 +137,8 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 # Pull request hygiene
 
+Always file a GitHub issue before opening a PR for a bug fix or new feature. The Zed team closes PRs that arrive without a linked issue — even good fixes. Open the issue first, confirm the team is receptive, then open the PR with `Closes #NNNNN` in the body.
+
 When an agent opens or updates a pull request, it must:
 
 - Use a clear, correctly capitalized, imperative PR title (for example, `Fix crash in project panel`).

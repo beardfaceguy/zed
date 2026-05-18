@@ -3582,4 +3582,42 @@ mod tests {
             }
         }
     }
+
+    #[gpui::test]
+    async fn test_display_only_terminal_scrollback_bounded(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let scrollback_limit = 200usize;
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                CursorShape::default(),
+                AlternateScroll::On,
+                Some(scrollback_limit),
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .expect("failed to create display-only terminal")
+            .subscribe(cx)
+        });
+
+        // Write 5x the scrollback limit worth of lines.
+        let lines_to_write = scrollback_limit * 5;
+        for i in 0..lines_to_write {
+            let line = format!("line {i}\n");
+            terminal.update(cx, |term, cx| {
+                term.write_output(line.as_bytes(), cx);
+            });
+        }
+
+        // total_lines() = scrollback rows + viewport rows; viewport is at least 1.
+        // The scrollback portion must not exceed the configured limit.
+        let total = terminal.read_with(cx, |term, _cx| term.total_lines());
+        let viewport = terminal.read_with(cx, |term, _cx| term.viewport_lines());
+        let scrollback = total.saturating_sub(viewport);
+        assert!(
+            scrollback <= scrollback_limit,
+            "scrollback grew to {scrollback} lines, exceeding limit of {scrollback_limit}"
+        );
+    }
 }

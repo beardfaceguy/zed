@@ -6173,4 +6173,97 @@ mod tests {
             "tool calls that left InProgress before the timeout must not trigger cancel"
         );
     }
+
+    // Regression test for ACP terminal scrollback memory leak:
+    // terminals must be removed from the thread's hashmap when they exit,
+    // so their alacritty grid memory can be reclaimed. Without the fix,
+    // every bash tool call in a session leaks ~7MB (10k-line scrollback buffer)
+    // for the entire lifetime of the ACP thread.
+    #[gpui::test]
+    async fn test_acp_terminals_removed_on_exit(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to create session");
+
+        let terminal_id = acp::TerminalId::new(uuid::Uuid::new_v4().to_string());
+
+        let lower = cx.new(|cx| {
+            let builder = ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .expect("failed to create display-only terminal");
+            builder.subscribe(cx)
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "leak test".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower.clone(),
+                },
+                cx,
+            );
+        });
+
+        // Write enough output to fill most of the scrollback buffer.
+        for i in 0..500 {
+            let data = format!("output line {i}\n").into_bytes();
+            thread.update(cx, |thread, cx| {
+                thread.on_terminal_provider_event(
+                    TerminalProviderEvent::Output {
+                        terminal_id: terminal_id.clone(),
+                        data,
+                    },
+                    cx,
+                );
+            });
+        }
+
+        // Verify the terminal is tracked while active.
+        thread.read_with(cx, |thread, _cx| {
+            assert!(
+                thread.terminal(terminal_id.clone()).is_ok(),
+                "terminal should be present before exit"
+            );
+        });
+
+        // Signal that the terminal's command has finished.
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: terminal_id.clone(),
+                    status: acp::TerminalExitStatus::new().exit_code(0),
+                },
+                cx,
+            );
+        });
+
+        // After exit the terminal should be removed so its memory can be freed.
+        thread.read_with(cx, |thread, _cx| {
+            assert!(
+                thread.terminal(terminal_id.clone()).is_err(),
+                "terminal should be removed from the thread after exit to free scrollback memory"
+            );
+        });
+    }
 }
