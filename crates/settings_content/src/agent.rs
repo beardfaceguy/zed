@@ -218,6 +218,18 @@ pub struct AgentSettingsContent {
     /// it cancels the entire current turn, not a single tool call. Leave
     /// unset (the default) to wait indefinitely.
     pub external_agent_tool_timeout_seconds: Option<u64>,
+    /// When `true`, automatically approve every `session/request_permission`
+    /// request raised by external ACP agents (e.g. Cursor, Claude Code,
+    /// Gemini CLI) without showing a confirmation prompt.
+    ///
+    /// Zed's own `tool_permissions` rules do **not** apply to external ACP
+    /// agents — those agents own their own permission decisions and delegate
+    /// the prompt UI to Zed. This switch is a blanket "trust the agent" bypass
+    /// for that delegated prompt. Each external agent may also enforce its own
+    /// hardcoded refusals; this setting cannot override those.
+    ///
+    /// Default: false
+    pub always_allow_external_agent_tools: Option<bool>,
 }
 
 impl AgentSettingsContent {

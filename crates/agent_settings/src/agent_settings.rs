@@ -176,6 +176,7 @@ pub struct AgentSettings {
     /// turn — ACP does not provide per-call cancellation. `None` (the
     /// default) preserves the existing behavior of waiting indefinitely.
     pub external_agent_tool_timeout_seconds: Option<u64>,
+    pub always_allow_external_agent_tools: bool,
 }
 
 impl AgentSettings {
@@ -681,6 +682,9 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             external_agent_tool_timeout_seconds: agent.external_agent_tool_timeout_seconds,
+            always_allow_external_agent_tools: agent
+                .always_allow_external_agent_tools
+                .unwrap_or(false),
         }
     }
 }
