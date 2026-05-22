@@ -13,9 +13,10 @@ pub mod pane_group;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
+pub mod path_link;
 mod persistence;
 pub mod searchable;
-mod security_modal;
+pub mod security_modal;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
 pub mod focus_follows_mouse;
@@ -6685,6 +6686,12 @@ impl Workspace {
             ActiveCallEvent::LocalScreenShareStopped => {
                 self.handle_auto_watch_local_share_stopped(window, cx);
             }
+            ActiveCallEvent::RoomLeft => {
+                if self.auto_watch.enabled() {
+                    self.auto_watch = AutoWatch::Off;
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -8136,6 +8143,7 @@ pub enum ActiveCallEvent {
     RemoteVideoTracksChanged { participant_id: PeerId },
     LocalScreenShareStarted,
     LocalScreenShareStopped,
+    RoomLeft,
 }
 
 fn leader_border_for_pane(
