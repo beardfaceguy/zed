@@ -4033,14 +4033,13 @@ mod tests {
         let scrollback_limit = 200usize;
         let terminal = cx.new(|cx| {
             TerminalBuilder::new_display_only(
-                CursorShape::default(),
+                SettingsCursorShape::default(),
                 AlternateScroll::On,
                 Some(scrollback_limit),
                 0,
                 cx.background_executor(),
                 util::paths::PathStyle::local(),
             )
-            .expect("failed to create display-only terminal")
             .subscribe(cx)
         });
 

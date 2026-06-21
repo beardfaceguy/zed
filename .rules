@@ -141,6 +141,7 @@ Always file a GitHub issue before opening a PR for a bug fix or new feature. The
 
 When an agent opens or updates a pull request, it must:
 
+- Before submitting, review the PR template and render sanity checklist documented in Vikunja task `#387` (`PR submission template + render sanity checklist (Zed upstream)`), and confirm the body has no markdown/template artifacts.
 - Use a clear, correctly capitalized, imperative PR title (for example, `Fix crash in project panel`).
 - Avoid conventional commit prefixes in PR titles (`fix:`, `feat:`, `docs:`, etc.).
 - Avoid trailing punctuation in PR titles.
