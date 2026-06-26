@@ -28,7 +28,7 @@ use project::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Formatter, Write};
 use std::ops::Range;
@@ -1716,7 +1716,7 @@ pub struct AcpThread {
     available_commands: Vec<acp::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
-    pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
+    pending_terminal_output: HashMap<acp::TerminalId, PendingTerminalOutput>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     had_error: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
@@ -1787,6 +1787,42 @@ pub enum AcpThreadEvent {
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
+
+/// Maximum bytes of terminal output buffered per terminal *before* its
+/// `Created` event arrives. Output for a `terminal_id` that never receives a
+/// `Created` (e.g. a `ToolCall` without `terminal_info`, or out-of-order
+/// delivery) would otherwise accumulate without bound — an agent tool emitting
+/// gigabytes of output could buffer gigabytes here. We keep the most recent
+/// bytes (like scrollback) and drop the oldest once over the cap.
+const MAX_PENDING_TERMINAL_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bounded buffer for terminal output that arrives before the terminal's
+/// `Created` event. Drops the oldest bytes once `MAX_PENDING_TERMINAL_OUTPUT_BYTES`
+/// is exceeded so a flood for a never-created terminal can't grow unbounded.
+#[derive(Default)]
+struct PendingTerminalOutput {
+    chunks: VecDeque<Vec<u8>>,
+    total_bytes: usize,
+}
+
+impl PendingTerminalOutput {
+    fn push(&mut self, mut data: Vec<u8>) {
+        // A single chunk larger than the cap is truncated to its tail, so one
+        // gigantic write can't blow the bound on its own.
+        if data.len() > MAX_PENDING_TERMINAL_OUTPUT_BYTES {
+            let keep_from = data.len() - MAX_PENDING_TERMINAL_OUTPUT_BYTES;
+            data.drain(..keep_from);
+        }
+        self.total_bytes += data.len();
+        self.chunks.push_back(data);
+        while self.total_bytes > MAX_PENDING_TERMINAL_OUTPUT_BYTES {
+            let Some(dropped) = self.chunks.pop_front() else {
+                break;
+            };
+            self.total_bytes -= dropped.len();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum TerminalProviderEvent {
@@ -3229,6 +3265,9 @@ impl AcpThread {
                 // state even when the send_task is cancelled before tx.send().
                 if is_same_turn {
                     this.running_turn.take();
+                    // No newer turn is running, so any output still buffered for
+                    // a terminal that was never created can never be drained.
+                    this.clear_orphaned_pending_terminals();
                 }
 
                 let Ok(response) = response else {
@@ -4001,6 +4040,18 @@ impl AcpThread {
         }
     }
 
+    /// Drops buffered terminal output/exit for ids that never received a
+    /// `Created` event. Without a `Created` the buffer can never be drained, so
+    /// once the turn that could have created them is done these are pure waste;
+    /// clearing them at turn boundaries reclaims the memory.
+    fn clear_orphaned_pending_terminals(&mut self) {
+        let terminals = &self.terminals;
+        self.pending_terminal_output
+            .retain(|id, _| terminals.contains_key(id));
+        self.pending_terminal_exit
+            .retain(|id, _| terminals.contains_key(id));
+    }
+
     pub fn on_terminal_provider_event(
         &mut self,
         event: TerminalProviderEvent,
@@ -4023,8 +4074,8 @@ impl AcpThread {
                     cx,
                 );
 
-                if let Some(mut chunks) = self.pending_terminal_output.remove(&terminal_id) {
-                    for data in chunks.drain(..) {
+                if let Some(mut pending) = self.pending_terminal_output.remove(&terminal_id) {
+                    for data in pending.chunks.drain(..) {
                         entity.update(cx, |term, cx| {
                             term.inner().update(cx, |inner, cx| {
                                 inner.write_output(&data, cx);
@@ -4146,6 +4197,60 @@ mod tests {
         time::Duration,
     };
     use util::{path, path_list::PathList};
+
+    #[test]
+    fn pending_terminal_output_is_bounded() {
+        // Output for a terminal that never gets a `Created` event must not grow
+        // without bound. Flood far past the cap and confirm it stays bounded and
+        // the byte counter stays consistent with the buffered chunks.
+        let mut pending = PendingTerminalOutput::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        let floods = (MAX_PENDING_TERMINAL_OUTPUT_BYTES / chunk.len()) * 4;
+        for _ in 0..floods {
+            pending.push(chunk.clone());
+        }
+        assert!(
+            pending.total_bytes <= MAX_PENDING_TERMINAL_OUTPUT_BYTES,
+            "buffer exceeded cap: {} > {}",
+            pending.total_bytes,
+            MAX_PENDING_TERMINAL_OUTPUT_BYTES
+        );
+        let actual: usize = pending.chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(pending.total_bytes, actual, "byte counter drifted");
+    }
+
+    #[test]
+    fn pending_terminal_output_keeps_recent_tail() {
+        // The oldest bytes are dropped first (scrollback semantics): the most
+        // recent output survives, the oldest is evicted.
+        let mut pending = PendingTerminalOutput::default();
+        pending.push(b"OLDEST".to_vec());
+        pending.push(vec![b'y'; MAX_PENDING_TERMINAL_OUTPUT_BYTES]);
+        pending.push(b"NEWEST".to_vec());
+        assert!(pending.total_bytes <= MAX_PENDING_TERMINAL_OUTPUT_BYTES);
+        let buffered: Vec<u8> = pending.chunks.iter().flatten().copied().collect();
+        assert!(
+            !buffered.windows(6).any(|w| w == b"OLDEST"),
+            "oldest bytes should have been evicted"
+        );
+        assert!(
+            buffered.windows(6).any(|w| w == b"NEWEST"),
+            "newest bytes should be retained"
+        );
+    }
+
+    #[test]
+    fn pending_terminal_output_truncates_oversized_chunk_to_tail() {
+        // A single chunk larger than the cap is truncated to its tail rather
+        // than blowing the bound or being dropped wholesale.
+        let mut pending = PendingTerminalOutput::default();
+        let mut huge = vec![b'a'; MAX_PENDING_TERMINAL_OUTPUT_BYTES * 2];
+        huge.extend_from_slice(b"TAIL");
+        pending.push(huge);
+        assert!(pending.total_bytes <= MAX_PENDING_TERMINAL_OUTPUT_BYTES);
+        let buffered: Vec<u8> = pending.chunks.iter().flatten().copied().collect();
+        assert!(buffered.ends_with(b"TAIL"), "tail of oversized chunk lost");
+    }
 
     #[test]
     fn command_category_meta_round_trips() {
@@ -7925,13 +8030,15 @@ mod tests {
         );
     }
 
-    // Regression test for ACP terminal scrollback memory leak:
-    // terminals must be removed from the thread's hashmap when they exit,
-    // so their alacritty grid memory can be reclaimed. Without the fix,
-    // every bash tool call in a session leaks ~7MB (10k-line scrollback buffer)
-    // for the entire lifetime of the ACP thread.
+    // A terminal must remain accessible after its command exits: its output is
+    // still displayed (held by the tool call's content block) and checkpoint
+    // restore relies on completed terminals staying in the thread's map. The
+    // terminal — including its bounded scrollback — is reclaimed only when the
+    // thread or the owning entries are dropped. (The unbounded-growth leak lived
+    // in `pending_terminal_output`, which is covered by the
+    // `pending_terminal_output_*` unit tests, not here.)
     #[gpui::test]
-    async fn test_acp_terminals_removed_on_exit(cx: &mut gpui::TestAppContext) {
+    async fn test_acp_terminal_persists_after_exit(cx: &mut gpui::TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -7958,8 +8065,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .expect("failed to create display-only terminal");
+            );
             builder.subscribe(cx)
         });
 
@@ -8009,11 +8115,12 @@ mod tests {
             );
         });
 
-        // After exit the terminal should be removed so its memory can be freed.
+        // After exit the terminal must still be accessible: its output stays
+        // displayed and checkpoint restore depends on it remaining in the map.
         thread.read_with(cx, |thread, _cx| {
             assert!(
-                thread.terminal(terminal_id.clone()).is_err(),
-                "terminal should be removed from the thread after exit to free scrollback memory"
+                thread.terminal(terminal_id.clone()).is_ok(),
+                "terminal should remain in the thread after exit so its output stays displayed and checkpoint restore can manage it"
             );
         });
     }
