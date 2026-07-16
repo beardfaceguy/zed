@@ -135,6 +135,55 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+### Building a runnable binary on a memory/disk-constrained machine
+
+Building Zed here has repeatedly failed for environmental (not code) reasons.
+The failures look like compiler/linker errors but are actually the machine
+running out of RAM or disk. Follow this to avoid re-diagnosing it each time:
+
+- **`systemd-oomd`/`earlyoom` kill the build, not the kernel OOM killer.**
+  On Ubuntu these userspace daemons kill the whole terminal cgroup based on
+  memory *pressure* (PSI > ~40% for 10s with reclaim), *before* the kernel OOM
+  killer, and they log to the journal (not `dmesg`). Symptom: the shell dies
+  mid-link (e.g. Konsole prints `Program '/usr/bin/zsh' crashed`) with a clean
+  kernel log. Adding swap makes it *worse* (thrashing = more pressure). Disable
+  them for the build, then re-enable:
+  ```
+  sudo systemctl stop systemd-oomd.socket systemd-oomd.service earlyoom
+  # ...build...
+  sudo systemctl start systemd-oomd.socket systemd-oomd.service earlyoom
+  ```
+  A true kernel OOM (`Out of memory: Killed process ... (rustc)` in `dmesg`)
+  is a *different* failure — that one means genuinely too little RAM+swap; fix
+  it with `-j` and profile choice below, not by disabling oomd.
+
+- **Prefer the `release-fast` profile over `release` for local runnable builds.**
+  `release` uses `codegen-units=1` — one giant unit per crate, ~4.5 GB in a
+  single `rustc` for big crates like `project` — so parallel jobs blow past
+  RAM. `release-fast` uses `codegen-units=16` + `lto=false`: much lower peak
+  RAM and a lighter final link. `release-fast` defaults to `debug="full"`,
+  which is huge on disk (~50 GB of `target/`); override it for runnable builds:
+  ```
+  CARGO_PROFILE_RELEASE_FAST_DEBUG=limited cargo build --profile release-fast -p zed -j6
+  ```
+  (`-j6` caps concurrent compiles; drop to `-j4` if RAM is still tight.
+  Use full debug only when a heap profiler needs rich symbols.)
+
+- **The final `zed(bin)` link is the peak-memory moment** (~20 GB). Close Zed
+  and other heavy apps before it reaches the link step.
+
+- **Don't run the build inside an editor's integrated terminal.** If that editor
+  (a leaky Zed, say) crashes, it takes the terminal's shell — and the build —
+  with it. Use a standalone terminal, or detach with `setsid ... &`.
+
+- **Watch `target/` disk usage.** A full `debug="full"` build plus the ~6 GB
+  binary can fill the disk (`No space left on device`, often reported as an
+  `rlib`/LLVM IO error). `cargo clean` reclaims it; `debug="limited"` keeps it
+  to ~25-35 GB.
+
+- Build without `--features mimalloc` (the default) when profiling the heap, so
+  `heaptrack`/valgrind can intercept the system allocator.
+
 # Pull request hygiene
 
 Always file a GitHub issue before opening a PR for a bug fix or new feature. The Zed team closes PRs that arrive without a linked issue — even good fixes. Open the issue first, confirm the team is receptive, then open the PR with `Closes #NNNNN` in the body.
