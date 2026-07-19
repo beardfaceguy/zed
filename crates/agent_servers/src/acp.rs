@@ -4965,29 +4965,28 @@ fn handle_create_terminal(
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
-            let terminal_entity = acp_thread::create_terminal_entity(
-                args.command.clone(),
-                &args.args,
-                args.env
-                    .into_iter()
-                    .map(|env| (env.name, env.value))
-                    .collect(),
-                args.cwd.clone(),
-                &project,
-                cx,
-            )
-            .await?;
-
-            let terminal_entity = thread.update(cx, |thread, cx| {
-                thread.register_terminal_created(
-                    acp::TerminalId::new(uuid::Uuid::new_v4().to_string()),
-                    format!("{} {}", args.command, args.args.join(" ")),
-                    args.cwd.clone(),
-                    args.output_byte_limit,
-                    terminal_entity,
-                    cx,
-                )
-            })?;
+            let sandbox_wrap: Option<acp_thread::SandboxWrap> = project
+                .read_with(cx, |project, cx| {
+                    acp_thread::persistent_sandbox_wrap(
+                        project,
+                        external_agent_wsl_zed_release(cx),
+                        cx,
+                    )
+                })
+                .map_err(acp::Error::from)?;
+            let terminal_entity = thread
+                .update(cx, |thread, cx| {
+                    thread.create_terminal(
+                        args.command.clone(),
+                        args.args.clone(),
+                        args.env.clone(),
+                        args.cwd.clone(),
+                        args.output_byte_limit,
+                        sandbox_wrap,
+                        cx,
+                    )
+                })?
+                .await?;
             let terminal_id = terminal_entity.read_with(cx, |terminal, _| terminal.id().clone());
             Ok(terminal_id)
         }
@@ -5003,6 +5002,28 @@ fn handle_create_terminal(
         }
     })
     .detach();
+}
+
+#[cfg(target_os = "windows")]
+fn external_agent_wsl_zed_release(cx: &App) -> Option<(String, String)> {
+    use release_channel::{AppVersion, ReleaseChannel};
+    match *release_channel::RELEASE_CHANNEL {
+        ReleaseChannel::Dev | ReleaseChannel::Nightly => {
+            Some(("nightly".to_string(), "latest".to_string()))
+        }
+        channel => {
+            let version = AppVersion::global(cx);
+            Some((
+                channel.dev_name().to_string(),
+                format!("{}.{}.{}", version.major, version.minor, version.patch),
+            ))
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn external_agent_wsl_zed_release(_cx: &App) -> Option<(String, String)> {
+    None
 }
 
 fn handle_kill_terminal(

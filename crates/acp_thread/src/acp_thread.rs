@@ -4499,6 +4499,9 @@ impl AcpThread {
             let mut env = env.await.unwrap_or_default();
             // Disables paging for `git` and hopefully other commands
             env.insert("PAGER".into(), "".into());
+            // Preserve create_terminal_entity's Git-specific override. The
+            // sandboxed Windows path runs under Linux/WSL, where `cat` exists.
+            env.insert("GIT_PAGER".into(), "cat".into());
             for var in extra_env {
                 env.insert(var.name, var.value);
             }

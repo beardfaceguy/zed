@@ -1,13 +1,15 @@
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::{AgentSettings, SandboxPermissions};
 use anyhow::Result;
 use collections::HashMap;
 use futures::{FutureExt as _, future::Shared};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
-use http_proxy::Allowlist;
+use http_proxy::{Allowlist, HostPattern};
 use language::LanguageRegistry;
 use markdown::Markdown;
 use project::Project;
 use serde::{Deserialize, Serialize};
+use settings::Settings;
 use std::{
     collections::HashMap as StdHashMap,
     path::PathBuf,
@@ -76,6 +78,113 @@ pub enum SandboxNetworkAccess {
     Restricted(Allowlist),
     /// Allow unrestricted outbound network access.
     All,
+}
+
+pub fn sandbox_worktree_writable_paths(project: &Project, cx: &App) -> Vec<PathBuf> {
+    project
+        .worktrees(cx)
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        .collect()
+}
+
+pub fn sandbox_git_dirs(project: &Project, cx: &App) -> Vec<PathBuf> {
+    let mut git_dirs = Vec::new();
+    for worktree in project.worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let worktree_abs_path = worktree.abs_path();
+        // Include a not-yet-existing `.git` so `git init` cannot create
+        // writable metadata after policy construction.
+        git_dirs.push(worktree_abs_path.join(".git"));
+        if let Some(root_repo_common_dir) = worktree.root_repo_common_dir() {
+            git_dirs.push(root_repo_common_dir.to_path_buf());
+        }
+    }
+    for repository in project.git_store().read(cx).repositories().values() {
+        let repository = repository.read(cx);
+        git_dirs.push(repository.dot_git_abs_path.to_path_buf());
+        git_dirs.push(repository.repository_dir_abs_path.to_path_buf());
+        git_dirs.push(repository.common_dir_abs_path.to_path_buf());
+    }
+    git_dirs.sort();
+    git_dirs.dedup();
+    git_dirs
+}
+
+pub fn persistent_sandbox_wrap(
+    project: &Project,
+    wsl_zed_release: Option<(String, String)>,
+    cx: &App,
+) -> Result<Option<SandboxWrap>> {
+    if !project.is_local()
+        || !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ))
+    {
+        return Ok(None);
+    }
+    let permissions = &AgentSettings::get_global(cx).sandbox_permissions;
+    sandbox_wrap_from_permissions(
+        permissions,
+        sandbox_worktree_writable_paths(project, cx),
+        sandbox_git_dirs(project, cx),
+        true,
+        wsl_zed_release,
+    )
+}
+
+fn sandbox_wrap_from_permissions(
+    permissions: &SandboxPermissions,
+    writable_paths: Vec<PathBuf>,
+    protected_paths: Vec<PathBuf>,
+    is_local: bool,
+    wsl_zed_release: Option<(String, String)>,
+) -> Result<Option<SandboxWrap>> {
+    if permissions.allow_unsandboxed {
+        return Ok(None);
+    }
+    let network = if permissions.allow_all_hosts {
+        SandboxNetworkAccess::All
+    } else if permissions.network_hosts.is_empty() {
+        SandboxNetworkAccess::None
+    } else {
+        let patterns = permissions
+            .network_hosts
+            .iter()
+            .filter_map(|host| match HostPattern::parse(host) {
+                Ok(pattern) => Some(pattern),
+                Err(error) => {
+                    log::warn!(
+                        "ignoring invalid network host pattern '{host}' in sandbox settings: {error}"
+                    );
+                    None
+                }
+            });
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            SandboxNetworkAccess::Restricted(Allowlist::from_patterns(patterns))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // Match the native terminal path: a saved host-specific grant that
+            // this platform cannot enforce is an error, never silently widened
+            // to all hosts or narrowed to no network.
+            if patterns.count() > 0 {
+                anyhow::bail!("This platform cannot enforce host-specific sandbox network access");
+            }
+            SandboxNetworkAccess::None
+        }
+    };
+    Ok(Some(SandboxWrap {
+        writable_paths,
+        extra_write_paths: permissions.write_paths.clone(),
+        network,
+        protected_paths,
+        allow_fs_write: permissions.allow_fs_write_all,
+        is_local,
+        wsl_zed_release,
+    }))
 }
 
 /// A structured, serializable reason the OS sandbox could not be created for a
@@ -569,4 +678,78 @@ pub async fn create_terminal_entity(
             )
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_permissions_build_restricted_wrap() {
+        let permissions = SandboxPermissions {
+            write_paths: vec![PathBuf::from("/approved")],
+            ..Default::default()
+        };
+        let wrap = sandbox_wrap_from_permissions(
+            &permissions,
+            vec![PathBuf::from("/worktree")],
+            vec![PathBuf::from("/worktree/.git")],
+            true,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(wrap.writable_paths, vec![PathBuf::from("/worktree")]);
+        assert_eq!(wrap.extra_write_paths, vec![PathBuf::from("/approved")]);
+        assert_eq!(wrap.protected_paths, vec![PathBuf::from("/worktree/.git")]);
+        assert!(!wrap.allow_fs_write);
+        assert!(matches!(wrap.network, SandboxNetworkAccess::None));
+    }
+
+    #[test]
+    fn persistent_unsandboxed_setting_disables_wrap() {
+        let permissions = SandboxPermissions {
+            allow_unsandboxed: true,
+            ..Default::default()
+        };
+        assert!(
+            sandbox_wrap_from_permissions(&permissions, vec![], vec![], true, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persistent_unrestricted_grants_are_preserved() {
+        let permissions = SandboxPermissions {
+            allow_all_hosts: true,
+            allow_fs_write_all: true,
+            ..Default::default()
+        };
+        let wrap = sandbox_wrap_from_permissions(&permissions, vec![], vec![], true, None)
+            .unwrap()
+            .unwrap();
+        assert!(wrap.allow_fs_write);
+        assert!(matches!(wrap.network, SandboxNetworkAccess::All));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn persistent_network_hosts_build_restricted_allowlist() {
+        let permissions = SandboxPermissions {
+            network_hosts: vec!["github.com".to_string()],
+            ..Default::default()
+        };
+        let wrap = sandbox_wrap_from_permissions(&permissions, vec![], vec![], true, None)
+            .unwrap()
+            .unwrap();
+        match wrap.network {
+            SandboxNetworkAccess::Restricted(allowlist) => {
+                assert!(allowlist.allows("github.com"));
+                assert!(!allowlist.allows("example.com"));
+            }
+            other => panic!("expected restricted network, got {other:?}"),
+        }
+    }
 }
