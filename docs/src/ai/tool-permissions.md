@@ -162,11 +162,56 @@ You can use the "Test Your Rules" checker, available in each individual tool pag
 
 ## External ACP Agents
 
-`tool_permissions` applies only to Zed's **native** agent tools. External
-agents that talk to Zed over the [Agent Client Protocol](https://agentclientprotocol.com)
-(e.g. Cursor, Claude Code, Gemini CLI) own their own permission decisions and
-ask Zed to display the confirmation UI for every tool call. Because the agent
-controls when to ask, the per-tool patterns above cannot match against them.
+External agents that talk to Zed over the
+[Agent Client Protocol](https://agentclientprotocol.com) (e.g. Cursor, Claude
+Code, Gemini CLI) own when to request permission, but Zed can apply scoped
+rules before showing their delegated confirmation UI. Add reserved entries to
+`agent.tool_permissions.tools`:
+
+```json [settings]
+{
+  "agent": {
+    "tool_permissions": {
+      "tools": {
+        "external_agent:daimonos:kind:read": {
+          "default": "allow"
+        },
+        "external_agent:daimonos:kind:search": {
+          "default": "allow"
+        },
+        "external_agent:daimonos:kind:execute": {
+          "default": "confirm",
+          "always_deny": [
+            { "pattern": "\"command\":\"rm -rf" }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Keys have these forms:
+
+- `external_agent:<agent-id>:tool:<tool-name>` — exact tool
+- `external_agent:<agent-id>:kind:<kind>` — ACP tool kind (`read`, `edit`,
+  `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, or
+  `other`)
+- `external_agent:<agent-id>:*` — fallback for that agent
+
+Use `*` as `<agent-id>` for cross-agent fallbacks. Exact agent/tool rules take
+precedence over kind rules. All rules for a specific agent—including
+`external_agent:<agent-id>:*`—are evaluated before cross-agent
+`external_agent:*:…` fallbacks. Within one rule, deny patterns take precedence
+over confirm, then allow, then its default. Invalid regexes fail closed.
+External regexes match the compact JSON raw input supplied by the agent. Exact
+tool-name rules require the agent to provide ACP `tool_name` metadata; UI
+titles are never treated as security identifiers. Agents that do not provide
+a stable tool name can still be controlled by tool kind.
+
+A scoped `"allow"` rule selects only the agent's `allow_once` option. If the
+agent offers only `allow_always`, Zed shows the confirmation UI instead of
+persisting approval beyond the matched rule's scope.
 
 If you want a single switch that auto-approves every external-agent prompt:
 
@@ -178,11 +223,10 @@ If you want a single switch that auto-approves every external-agent prompt:
 }
 ```
 
-When enabled, Zed responds to every `session/request_permission` request with
-the agent's `allow_always` option (or `allow_once` if no `allow_always` is
-offered) and never shows the prompt UI. This is equivalent to running the
-external agent in a "yolo" / "always allow" mode, so use it only with agents
-you fully trust.
+This legacy setting is consulted only when no scoped external-agent rule
+matches. When enabled, Zed responds with the agent's `allow_always` option (or
+`allow_once` if unavailable) and skips the prompt UI. This is equivalent to a
+"yolo" / "always allow" mode, so use it only with agents you fully trust.
 
 This setting has no effect on Zed's native agent — use `tool_permissions`
 above for that.

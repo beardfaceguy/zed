@@ -267,6 +267,7 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
 
 /// Holds state needed by foreground work dispatched from background handler closures.
 struct ClientContext {
+    agent_id: AgentId,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
@@ -956,6 +957,7 @@ impl AcpConnection {
 
         // Set up the foreground dispatch loop to process work items from handlers.
         let dispatch_context = ClientContext {
+            agent_id: agent_id.clone(),
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
@@ -2551,6 +2553,7 @@ pub mod test_support {
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
+            agent_id: AgentId("zed-test".into()),
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
@@ -3866,6 +3869,7 @@ mod tests {
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
+            agent_id: AgentId("zed-test".into()),
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
@@ -4279,55 +4283,325 @@ mod tests {
         acp::PermissionOption::new(acp::PermissionOptionId::new(id), id.to_string(), kind)
     }
 
+    fn selected_option_id(outcome: acp::RequestPermissionOutcome) -> String {
+        match outcome {
+            acp::RequestPermissionOutcome::Selected(selected) => {
+                selected.option_id.0.to_string()
+            }
+            acp::RequestPermissionOutcome::Cancelled => panic!("expected selected outcome"),
+            _ => panic!("unexpected permission outcome"),
+        }
+    }
+
+    fn decision(
+        mode: settings::ToolPermissionMode,
+        prefer_allow_always: bool,
+    ) -> ExternalPermissionDecision {
+        ExternalPermissionDecision {
+            mode,
+            prefer_allow_always,
+        }
+    }
+
     #[test]
-    fn auto_approve_outcome_prefers_allow_always() {
+    fn automatic_allow_outcome_prefers_allow_always() {
         let options = vec![
             permission_option("once", acp::PermissionOptionKind::AllowOnce),
             permission_option("always", acp::PermissionOptionKind::AllowAlways),
             permission_option("reject", acp::PermissionOptionKind::RejectOnce),
         ];
-        let outcome =
-            auto_approve_outcome(&options).expect("expected auto-approve outcome to be selected");
-        assert_eq!(outcome.option_id.0.as_ref(), "always");
+        let outcome = automatic_permission_outcome(
+            decision(settings::ToolPermissionMode::Allow, true),
+            &options,
+        )
+            .expect("expected auto-approve outcome to be selected");
+        assert_eq!(selected_option_id(outcome), "always");
     }
 
     #[test]
-    fn auto_approve_outcome_falls_back_to_allow_once() {
+    fn scoped_automatic_allow_uses_allow_once() {
+        let options = vec![
+            permission_option("once", acp::PermissionOptionKind::AllowOnce),
+            permission_option("always", acp::PermissionOptionKind::AllowAlways),
+        ];
+        let outcome = automatic_permission_outcome(
+            decision(settings::ToolPermissionMode::Allow, false),
+            &options,
+        )
+        .expect("expected scoped auto-allow outcome");
+        assert_eq!(selected_option_id(outcome), "once");
+    }
+
+    #[test]
+    fn automatic_allow_outcome_falls_back_to_allow_once() {
         let options = vec![
             permission_option("reject_always", acp::PermissionOptionKind::RejectAlways),
             permission_option("once", acp::PermissionOptionKind::AllowOnce),
             permission_option("reject", acp::PermissionOptionKind::RejectOnce),
         ];
-        let outcome =
-            auto_approve_outcome(&options).expect("expected auto-approve outcome to be selected");
-        assert_eq!(outcome.option_id.0.as_ref(), "once");
+        let outcome = automatic_permission_outcome(
+            decision(settings::ToolPermissionMode::Allow, true),
+            &options,
+        )
+            .expect("expected auto-approve outcome to be selected");
+        assert_eq!(selected_option_id(outcome), "once");
     }
 
     #[test]
-    fn auto_approve_outcome_returns_none_when_only_reject_options() {
+    fn automatic_allow_outcome_returns_none_when_only_reject_options() {
         let options = vec![
             permission_option("reject", acp::PermissionOptionKind::RejectOnce),
             permission_option("reject_always", acp::PermissionOptionKind::RejectAlways),
         ];
-        assert!(auto_approve_outcome(&options).is_none());
+        assert!(
+            automatic_permission_outcome(
+                decision(settings::ToolPermissionMode::Allow, true),
+                &options
+            )
+            .is_none()
+        );
     }
 
     #[test]
-    fn auto_approve_outcome_returns_none_for_empty_options() {
+    fn automatic_outcome_returns_none_for_empty_options() {
         let options: Vec<acp::PermissionOption> = vec![];
-        assert!(auto_approve_outcome(&options).is_none());
+        assert!(
+            automatic_permission_outcome(
+                decision(settings::ToolPermissionMode::Allow, true),
+                &options
+            )
+            .is_none()
+        );
     }
 
     #[test]
-    fn auto_approve_outcome_picks_first_allow_always_when_multiple_present() {
+    fn automatic_allow_outcome_picks_first_allow_always_when_multiple_present() {
         let options = vec![
             permission_option("once", acp::PermissionOptionKind::AllowOnce),
             permission_option("always_a", acp::PermissionOptionKind::AllowAlways),
             permission_option("always_b", acp::PermissionOptionKind::AllowAlways),
         ];
-        let outcome =
-            auto_approve_outcome(&options).expect("expected auto-approve outcome to be selected");
-        assert_eq!(outcome.option_id.0.as_ref(), "always_a");
+        let outcome = automatic_permission_outcome(
+            decision(settings::ToolPermissionMode::Allow, true),
+            &options,
+        )
+            .expect("expected auto-approve outcome to be selected");
+        assert_eq!(selected_option_id(outcome), "always_a");
+    }
+
+    #[test]
+    fn automatic_deny_outcome_uses_reject_once() {
+        let options = vec![
+            permission_option("reject_once", acp::PermissionOptionKind::RejectOnce),
+            permission_option("reject_always", acp::PermissionOptionKind::RejectAlways),
+            permission_option("allow", acp::PermissionOptionKind::AllowOnce),
+        ];
+        let outcome = automatic_permission_outcome(
+            decision(settings::ToolPermissionMode::Deny, false),
+            &options,
+        )
+            .expect("expected automatic reject outcome");
+        assert_eq!(selected_option_id(outcome), "reject_once");
+    }
+
+    #[test]
+    fn automatic_deny_without_reject_once_cancels_fail_closed() {
+        let options = vec![
+            permission_option("reject_always", acp::PermissionOptionKind::RejectAlways),
+            permission_option("allow", acp::PermissionOptionKind::AllowOnce),
+        ];
+        assert!(matches!(
+            automatic_permission_outcome(
+                decision(settings::ToolPermissionMode::Deny, false),
+                &options
+            ),
+            Some(acp::RequestPermissionOutcome::Cancelled)
+        ));
+    }
+
+    fn external_rules(
+        entries: &[(&str, settings::ToolPermissionMode)],
+    ) -> agent_settings::ToolPermissions {
+        agent_settings::ToolPermissions {
+            tools: entries
+                .iter()
+                .map(|(key, mode)| {
+                    (
+                        Arc::from(*key),
+                        agent_settings::ToolRules {
+                            default: Some(*mode),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn external_permission_prefers_agent_tool_then_kind_and_wildcards() {
+        let permissions = external_rules(&[
+            (
+                "external_agent:daimonos:tool:read_file",
+                settings::ToolPermissionMode::Allow,
+            ),
+            (
+                "external_agent:daimonos:kind:read",
+                settings::ToolPermissionMode::Deny,
+            ),
+            (
+                "external_agent:*:kind:execute",
+                settings::ToolPermissionMode::Confirm,
+            ),
+            (
+                "external_agent:daimonos:*",
+                settings::ToolPermissionMode::Deny,
+            ),
+            (
+                "external_agent:*:tool:wildcard_allowed",
+                settings::ToolPermissionMode::Allow,
+            ),
+        ]);
+        let read = ExternalPermissionTarget {
+            tool_name: Some("read_file".to_string()),
+            kind: "read",
+            input: r#"{"path":"a.rs"}"#.to_string(),
+        };
+        assert_eq!(
+            external_permission_decision(&permissions, "daimonos", Some(&read), false).mode,
+            settings::ToolPermissionMode::Allow
+        );
+
+        let unknown_read = ExternalPermissionTarget {
+            tool_name: Some("other_read".to_string()),
+            kind: "read",
+            input: String::new(),
+        };
+        assert_eq!(
+            external_permission_decision(&permissions, "daimonos", Some(&unknown_read), false).mode,
+            settings::ToolPermissionMode::Deny
+        );
+
+        let execute = ExternalPermissionTarget {
+            tool_name: Some("shell".to_string()),
+            kind: "execute",
+            input: String::new(),
+        };
+        assert_eq!(
+            external_permission_decision(&permissions, "another-agent", Some(&execute), false).mode,
+            settings::ToolPermissionMode::Confirm
+        );
+
+        let wildcard_allowed = ExternalPermissionTarget {
+            tool_name: Some("wildcard_allowed".to_string()),
+            kind: "other",
+            input: String::new(),
+        };
+        assert_eq!(
+            external_permission_decision(
+                &permissions,
+                "daimonos",
+                Some(&wildcard_allowed),
+                false,
+            )
+            .mode,
+            settings::ToolPermissionMode::Deny,
+            "agent-wide rule must precede cross-agent wildcard tool rule"
+        );
+    }
+
+    #[test]
+    fn external_permission_patterns_and_legacy_fallback_preserve_precedence() {
+        let mut rules = agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Allow),
+            ..Default::default()
+        };
+        rules.always_deny.push(
+            agent_settings::CompiledRegex::try_new("rm.+-rf", false).expect("valid deny pattern"),
+        );
+        let permissions = agent_settings::ToolPermissions {
+            tools: [(Arc::from("external_agent:daimonos:kind:execute"), rules)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let dangerous = ExternalPermissionTarget {
+            tool_name: Some("exec".to_string()),
+            kind: "execute",
+            input: serde_json::json!({"command": "rm -rf /"}).to_string(),
+        };
+        assert_eq!(
+            external_permission_decision(&permissions, "daimonos", Some(&dangerous), true).mode,
+            settings::ToolPermissionMode::Deny
+        );
+
+        let unmatched = ExternalPermissionTarget {
+            tool_name: None,
+            kind: "other",
+            input: String::new(),
+        };
+        assert_eq!(
+            external_permission_decision(
+                &agent_settings::ToolPermissions::default(),
+                "x",
+                Some(&unmatched),
+                true,
+            )
+            .mode,
+            settings::ToolPermissionMode::Allow
+        );
+        assert_eq!(
+            external_permission_decision(
+                &agent_settings::ToolPermissions::default(),
+                "x",
+                Some(&unmatched),
+                false,
+            )
+            .mode,
+            settings::ToolPermissionMode::Confirm
+        );
+        assert_eq!(
+            external_permission_decision(
+                &agent_settings::ToolPermissions::default(),
+                "x",
+                None,
+                true,
+            )
+            .mode,
+            settings::ToolPermissionMode::Allow
+        );
+    }
+
+    #[test]
+    fn external_permission_invalid_patterns_fail_closed() {
+        let rules = agent_settings::ToolRules {
+            default: Some(settings::ToolPermissionMode::Allow),
+            invalid_patterns: vec![agent_settings::InvalidRegexPattern {
+                pattern: "[".to_string(),
+                rule_type: "always_allow".to_string(),
+                error: "unclosed character class".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            external_rule_mode(&rules, "{}"),
+            Some(settings::ToolPermissionMode::Deny)
+        );
+
+        let overlap =
+            agent_settings::CompiledRegex::try_new("danger", false).expect("valid overlap pattern");
+        let rules = agent_settings::ToolRules {
+            always_allow: vec![overlap.clone()],
+            always_confirm: vec![overlap.clone()],
+            always_deny: vec![overlap],
+            ..Default::default()
+        };
+        assert_eq!(
+            external_rule_mode(&rules, "danger"),
+            Some(settings::ToolPermissionMode::Deny),
+            "deny must take precedence over confirm and allow"
+        );
     }
 }
 
@@ -4507,21 +4781,170 @@ fn respond_err<T: JsonRpcResponse>(responder: Responder<T>, err: acp::Error) {
     responder.respond_with_error(err).log_err();
 }
 
-/// When `agent.always_allow_external_agent_tools` is enabled, picks an option
-/// to auto-approve from the set offered by the external agent. Prefers a
-/// remembered "allow always" choice, falling back to a one-shot allow when the
-/// agent only offers `allow_once`. Returns `None` if no allow-shaped option is
-/// available, in which case the normal confirmation UI is shown.
-fn auto_approve_outcome(
+struct ExternalPermissionTarget {
+    tool_name: Option<String>,
+    kind: &'static str,
+    input: String,
+}
+
+fn external_tool_kind_name(kind: acp::ToolKind) -> &'static str {
+    match kind {
+        acp::ToolKind::Read => "read",
+        acp::ToolKind::Edit => "edit",
+        acp::ToolKind::Delete => "delete",
+        acp::ToolKind::Move => "move",
+        acp::ToolKind::Search => "search",
+        acp::ToolKind::Execute => "execute",
+        acp::ToolKind::Think => "think",
+        acp::ToolKind::Fetch => "fetch",
+        acp::ToolKind::SwitchMode => "switch_mode",
+        acp::ToolKind::Other => "other",
+        _ => "other",
+    }
+}
+
+fn external_permission_target(
+    thread: &AcpThread,
+    update: &acp::ToolCallUpdate,
+) -> ExternalPermissionTarget {
+    let existing = thread
+        .tool_call(&update.tool_call_id)
+        .map(|(_, tool_call)| tool_call);
+    let tool_name = acp_thread::tool_name_from_meta(&update.meta)
+        .map(|name| name.to_string())
+        .or_else(|| {
+            existing.and_then(|tool_call| tool_call.tool_name.as_ref().map(ToString::to_string))
+        });
+    let kind = update
+        .fields
+        .kind
+        .or_else(|| existing.map(|tool_call| tool_call.kind))
+        .unwrap_or_default();
+    let input = update
+        .fields
+        .raw_input
+        .as_ref()
+        .or_else(|| existing.and_then(|tool_call| tool_call.raw_input.as_ref()))
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    ExternalPermissionTarget {
+        tool_name,
+        kind: external_tool_kind_name(kind),
+        input,
+    }
+}
+
+fn external_rule_mode(
+    rules: &agent_settings::ToolRules,
+    input: &str,
+) -> Option<settings::ToolPermissionMode> {
+    if !rules.invalid_patterns.is_empty()
+        || rules.always_deny.iter().any(|rule| rule.is_match(input))
+    {
+        return Some(settings::ToolPermissionMode::Deny);
+    }
+    if rules.always_confirm.iter().any(|rule| rule.is_match(input)) {
+        return Some(settings::ToolPermissionMode::Confirm);
+    }
+    if rules.always_allow.iter().any(|rule| rule.is_match(input)) {
+        return Some(settings::ToolPermissionMode::Allow);
+    }
+    rules.default
+}
+
+fn external_scoped_permission_mode(
+    permissions: &agent_settings::ToolPermissions,
+    agent_id: &str,
+    target: &ExternalPermissionTarget,
+) -> Option<settings::ToolPermissionMode> {
+    // A specific agent's namespace is its trust boundary: evaluate all of its
+    // rules, including its agent-wide default, before any cross-agent fallback.
+    let mut keys = Vec::new();
+    if let Some(tool_name) = &target.tool_name {
+        keys.push(format!("external_agent:{agent_id}:tool:{tool_name}"));
+    }
+    keys.push(format!("external_agent:{agent_id}:kind:{}", target.kind));
+    keys.push(format!("external_agent:{agent_id}:*"));
+    if let Some(tool_name) = &target.tool_name {
+        keys.push(format!("external_agent:*:tool:{tool_name}"));
+    }
+    keys.push(format!("external_agent:*:kind:{}", target.kind));
+    keys.push("external_agent:*:*".to_string());
+
+    for key in keys {
+        if let Some(mode) = permissions
+            .tools
+            .get(key.as_str())
+            .and_then(|rules| external_rule_mode(rules, &target.input))
+        {
+            return Some(mode);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct ExternalPermissionDecision {
+    mode: settings::ToolPermissionMode,
+    prefer_allow_always: bool,
+}
+
+fn external_permission_decision(
+    permissions: &agent_settings::ToolPermissions,
+    agent_id: &str,
+    target: Option<&ExternalPermissionTarget>,
+    legacy_allow_all: bool,
+) -> ExternalPermissionDecision {
+    if let Some(mode) =
+        target.and_then(|target| external_scoped_permission_mode(permissions, agent_id, target))
+    {
+        return ExternalPermissionDecision {
+            mode,
+            prefer_allow_always: false,
+        };
+    }
+    ExternalPermissionDecision {
+        mode: if legacy_allow_all {
+            settings::ToolPermissionMode::Allow
+        } else {
+            settings::ToolPermissionMode::Confirm
+        },
+        prefer_allow_always: legacy_allow_all,
+    }
+}
+
+fn automatic_permission_outcome(
+    decision: ExternalPermissionDecision,
     options: &[acp::PermissionOption],
-) -> Option<acp::SelectedPermissionOutcome> {
+) -> Option<acp::RequestPermissionOutcome> {
     let pick = |kind: acp::PermissionOptionKind| {
         options
             .iter()
             .find(|option| option.kind == kind)
             .map(|option| acp::SelectedPermissionOutcome::new(option.option_id.clone()))
     };
-    pick(acp::PermissionOptionKind::AllowAlways).or_else(|| pick(acp::PermissionOptionKind::AllowOnce))
+    match decision.mode {
+        settings::ToolPermissionMode::Allow => {
+            // Scoped rules never persist approval inside the external agent;
+            // doing so could suppress later requests governed by other rules.
+            let selected = if decision.prefer_allow_always {
+                pick(acp::PermissionOptionKind::AllowAlways)
+                    .or_else(|| pick(acp::PermissionOptionKind::AllowOnce))
+            } else {
+                pick(acp::PermissionOptionKind::AllowOnce)
+            };
+            selected.map(acp::RequestPermissionOutcome::Selected)
+        }
+        // A scoped Zed rule must not persist a broader refusal inside the
+        // external agent. Reject this request once, or cancel fail-closed when
+        // the agent does not offer a one-shot reject option.
+        settings::ToolPermissionMode::Deny => Some(
+            pick(acp::PermissionOptionKind::RejectOnce)
+                .map(acp::RequestPermissionOutcome::Selected)
+                .unwrap_or(acp::RequestPermissionOutcome::Cancelled),
+        ),
+        settings::ToolPermissionMode::Confirm => None,
+    }
 }
 
 fn respond_result<T: JsonRpcResponse>(responder: Responder<T>, result: Result<T, acp::Error>) {
@@ -4544,24 +4967,29 @@ fn handle_request_permission(
         Err(e) => return respond_err(responder, e),
     };
 
-    // Honor the global blanket-approve switch for external ACP agents. Read it
-    // synchronously here so the bypass doesn't race against later setting
-    // changes within the same prompt turn. `try_read_global` keeps us safe in
-    // the (unexpected) case where the settings store isn't installed yet.
-    let auto_approve = cx
-        .try_read_global::<settings::SettingsStore, _>(|_, cx| {
-            <agent_settings::AgentSettings as settings::Settings>::get_global(cx)
-                .always_allow_external_agent_tools
+    let target = thread
+        .read_with(cx, |thread, _cx| {
+            external_permission_target(thread, &args.tool_call)
         })
-        .unwrap_or(false);
+        .ok();
+    let permission_decision = cx
+        .try_read_global::<settings::SettingsStore, _>(|_, cx| {
+            let settings = <agent_settings::AgentSettings as settings::Settings>::get_global(cx);
+            external_permission_decision(
+                &settings.tool_permissions,
+                ctx.agent_id.0.as_ref(),
+                target.as_ref(),
+                settings.always_allow_external_agent_tools,
+            )
+        })
+        .unwrap_or(ExternalPermissionDecision {
+            mode: settings::ToolPermissionMode::Confirm,
+            prefer_allow_always: false,
+        });
 
-    if auto_approve
-        && let Some(outcome) = auto_approve_outcome(&args.options)
-    {
+    if let Some(outcome) = automatic_permission_outcome(permission_decision, &args.options) {
         responder
-            .respond(acp::RequestPermissionResponse::new(
-                acp::RequestPermissionOutcome::Selected(outcome),
-            ))
+            .respond(acp::RequestPermissionResponse::new(outcome))
             .log_err();
         return;
     }
