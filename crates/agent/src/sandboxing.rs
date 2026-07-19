@@ -37,10 +37,7 @@ use std::path::PathBuf;
 /// [`acp_thread::SandboxWrap::writable_paths`]) and the status UI (which lists
 /// them), so the two can't drift if the set ever changes.
 pub fn sandbox_worktree_writable_paths(project: &Project, cx: &App) -> Vec<PathBuf> {
-    project
-        .worktrees(cx)
-        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-        .collect()
+    acp_thread::sandbox_worktree_writable_paths(project, cx)
 }
 
 /// The candidate `.git` paths the sandbox protects for a project. Locating these
@@ -48,29 +45,7 @@ pub fn sandbox_worktree_writable_paths(project: &Project, cx: &App) -> Vec<PathB
 /// `.git`, a linked worktree's common dir (which lives outside the worktree),
 /// and every discovered repository's git/common dirs.
 pub fn sandbox_git_dirs(project: &Project, cx: &App) -> Vec<PathBuf> {
-    let mut git_dirs = Vec::new();
-
-    for worktree in project.worktrees(cx) {
-        let worktree = worktree.read(cx);
-        let worktree_abs_path = worktree.abs_path();
-        // Protect `<worktree>/.git` even when it doesn't exist yet, so a command
-        // can't `git init` and then write to the freshly created metadata.
-        git_dirs.push(worktree_abs_path.join(".git"));
-        if let Some(root_repo_common_dir) = worktree.root_repo_common_dir() {
-            git_dirs.push(root_repo_common_dir.to_path_buf());
-        }
-    }
-
-    for repository in project.git_store().read(cx).repositories().values() {
-        let repository = repository.read(cx);
-        git_dirs.push(repository.dot_git_abs_path.to_path_buf());
-        git_dirs.push(repository.repository_dir_abs_path.to_path_buf());
-        git_dirs.push(repository.common_dir_abs_path.to_path_buf());
-    }
-
-    git_dirs.sort();
-    git_dirs.dedup();
-    git_dirs
+    acp_thread::sandbox_git_dirs(project, cx)
 }
 
 /// What sandbox a thread applies to agent terminal commands, as one value the
