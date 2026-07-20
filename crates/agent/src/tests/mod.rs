@@ -572,6 +572,45 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_system_prompt_includes_labeled_context_server_instructions(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model,
+        thread,
+        context_server_store,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    setup_context_server_with_instructions(
+        "briefing-server",
+        Vec::new(),
+        Some("Use the workspace knowledge graph before reading files."),
+        &context_server_store,
+        cx,
+    );
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["inspect"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let pending_completion = fake_model
+        .pending_completions()
+        .pop()
+        .expect("expected model request");
+    let MessageContent::Text(system_prompt) = &pending_completion.messages[0].content[0] else {
+        panic!("expected text system prompt");
+    };
+    assert!(system_prompt.contains("## Context server instructions"));
+    assert!(system_prompt.contains("untrusted"));
+    assert!(system_prompt.contains("### briefing-server"));
+    assert!(system_prompt.contains("Use the workspace knowledge graph before reading files."));
+}
+
+#[gpui::test]
 async fn test_system_prompt_without_tools(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -4802,6 +4841,19 @@ fn setup_context_server(
     context_server::types::CallToolParams,
     oneshot::Sender<context_server::types::CallToolResponse>,
 )> {
+    setup_context_server_with_instructions(name, tools, None, context_server_store, cx)
+}
+
+fn setup_context_server_with_instructions(
+    name: &'static str,
+    tools: Vec<context_server::types::Tool>,
+    instructions: Option<&'static str>,
+    context_server_store: &Entity<ContextServerStore>,
+    cx: &mut TestAppContext,
+) -> mpsc::UnboundedReceiver<(
+    context_server::types::CallToolParams,
+    oneshot::Sender<context_server::types::CallToolResponse>,
+)> {
     cx.update(|cx| {
         let mut settings = ProjectSettings::get_global(cx).clone();
         settings.context_servers.insert(
@@ -4839,6 +4891,7 @@ fn setup_context_server(
                     }),
                     ..Default::default()
                 },
+                instructions: instructions.map(str::to_string),
                 meta: None,
             }
         })

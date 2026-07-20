@@ -4214,7 +4214,7 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -4230,6 +4230,12 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if let Some(context_server_instructions) =
+            self.context_server_registry.read(cx).rendered_instructions()
+        {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&context_server_instructions);
+        }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],

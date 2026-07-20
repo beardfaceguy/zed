@@ -277,6 +277,8 @@ pub struct InitializeResponse {
     pub protocol_version: ProtocolVersion,
     pub capabilities: ServerCapabilities,
     pub server_info: Implementation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, serde_json::Value>>,
 }

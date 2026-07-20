@@ -32,6 +32,7 @@ fn create_initialize_response(server_name: String) -> InitializeResponse {
             description: None,
         },
         capabilities: ServerCapabilities::default(),
+        instructions: None,
         meta: None,
     }
 }
