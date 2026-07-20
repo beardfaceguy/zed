@@ -14,6 +14,12 @@ Zed uses the [Model Context Protocol](https://modelcontextprotocol.io/) to inter
 Zed currently supports MCP's [Tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools) and [Prompts](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts) features.
 We welcome contributions that help advance Zed's MCP feature coverage (Discovery, Sampling, Elicitation, etc).
 
+For the Zed Agent, Zed also includes the optional `instructions` returned when
+each server initializes. These are labeled as untrusted, server-specific
+guidance in the system prompt and cannot override user intent or safety rules.
+Zed caps instructions at 8,192 characters per server and 32,768 characters in
+total. External agents manage their own MCP server instructions.
+
 Zed also handles the `notifications/tools/list_changed` notification from MCP servers. When a server adds, removes, or modifies its available tools at runtime, Zed automatically reloads the tool list without requiring a server restart.
 
 ## Agent Path Support {#agent-path-support}
