@@ -7,7 +7,9 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Lines, Responder,
+};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -21,7 +23,7 @@ use project::agent_server_store::{
 };
 use project::{AgentId, Project};
 use remote::remote_client::Interactive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -45,7 +47,29 @@ use crate::GEMINI_ID;
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
+const CLIENT_USER_MESSAGE_IDS_META_KEY: &str = "zed.dev/clientUserMessageIds";
+const SESSION_RETRY_META_KEY: &str = "zed.dev/sessionRetry";
+const SESSION_TRUNCATE_META_KEY: &str = "zed.dev/sessionTruncate";
+const CLIENT_USER_MESSAGE_ID_META_KEY: &str = "zed.dev/clientUserMessageId";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[serde(rename_all = "camelCase")]
+#[request(method = "_zed/session/retry", response = acp::PromptResponse)]
+struct RetrySessionRequest {
+    session_id: acp::SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[serde(rename_all = "camelCase")]
+#[request(method = "_zed/session/truncate", response = TruncateSessionResponse)]
+struct TruncateSessionRequest {
+    session_id: acp::SessionId,
+    client_user_message_id: acp_thread::ClientUserMessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct TruncateSessionResponse {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
@@ -782,6 +806,10 @@ fn client_capabilities() -> acp::ClientCapabilities {
 }
 
 impl AcpConnection {
+    fn supports_meta_capability(&self, key: &str) -> bool {
+        agent_supports_meta_capability(&self.agent_capabilities, key)
+    }
+
     pub fn subscribe_debug_messages(
         &self,
     ) -> (
@@ -1416,6 +1444,15 @@ impl AcpConnection {
     }
 }
 
+fn agent_supports_meta_capability(capabilities: &acp::AgentCapabilities, key: &str) -> bool {
+    capabilities
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionDirectories {
     cwd: PathBuf,
@@ -1563,6 +1600,183 @@ fn meta_terminal_auth_task(
         terminal_auth.args,
         terminal_auth.env,
     ))
+}
+
+fn send_prompt_request<Req>(
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    session_id: acp::SessionId,
+    request: Req,
+    cx: &mut App,
+) -> Task<Result<acp::PromptResponse>>
+where
+    Req: JsonRpcRequest<Response = acp::PromptResponse> + 'static,
+{
+    cx.foreground_executor().spawn(async move {
+        let result = connection.send_request(request).block_task().await;
+        let mut suppress_abort_err = false;
+        if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
+            suppress_abort_err = session.suppress_abort_err;
+            // This flag belongs to the request that just completed. Keeping it
+            // after any result would leak cancellation into a later turn.
+            session.suppress_abort_err = false;
+        }
+        match result {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                if err.code == acp::ErrorCode::AuthRequired {
+                    return Err(anyhow!(acp::Error::auth_required()));
+                }
+                if err.code != ErrorCode::InternalError {
+                    anyhow::bail!(err)
+                }
+                let Some(data) = &err.data else {
+                    anyhow::bail!(err)
+                };
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ErrorDetails {
+                    details: Box<str>,
+                }
+                match serde_json::from_value(data.clone()) {
+                    Ok(ErrorDetails { details }) => {
+                        if suppress_abort_err
+                            && (details.contains("This operation was aborted")
+                                || details.contains("The user aborted a request"))
+                        {
+                            Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                        } else {
+                            Err(anyhow!(details))
+                        }
+                    }
+                    Err(_) => Err(anyhow!(err)),
+                }
+            }
+        }
+    })
+}
+
+struct AcpClientUserMessageIds {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+}
+
+fn attach_client_user_message_id(
+    params: &mut acp::PromptRequest,
+    client_user_message_id: &acp_thread::ClientUserMessageId,
+) {
+    // Zed's generated ID is also stored on the local user message. It must be
+    // authoritative or a stale incoming value would make later truncation
+    // target a different message on the agent.
+    params.meta.get_or_insert_default().insert(
+        CLIENT_USER_MESSAGE_ID_META_KEY.to_string(),
+        client_user_message_id.as_str().into(),
+    );
+}
+
+impl acp_thread::AgentSessionClientUserMessageIds for AcpClientUserMessageIds {
+    fn prompt(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        mut params: acp::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        attach_client_user_message_id(&mut params, &client_user_message_id);
+        let session_id = params.session_id.clone();
+        send_prompt_request(
+            self.connection.clone(),
+            self.sessions.clone(),
+            session_id,
+            params,
+            cx,
+        )
+    }
+}
+
+struct AcpSessionRetry {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    session_id: acp::SessionId,
+}
+
+impl acp_thread::AgentSessionRetry for AcpSessionRetry {
+    fn run(&self, cx: &mut App) -> Task<Result<acp::PromptResponse>> {
+        let session_id = self.session_id.clone();
+        send_prompt_request(
+            self.connection.clone(),
+            self.sessions.clone(),
+            session_id.clone(),
+            RetrySessionRequest { session_id },
+            cx,
+        )
+    }
+}
+
+struct AcpSessionTruncate {
+    connection: ConnectionTo<Agent>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    session_id: acp::SessionId,
+}
+
+impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
+    fn run(
+        &self,
+        client_user_message_id: acp_thread::ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        let sessions = self.sessions.clone();
+        let session_id = self.session_id.clone();
+        cx.spawn(async move |_| {
+            let result = connection
+                .send_request(TruncateSessionRequest {
+                    session_id: session_id.clone(),
+                    client_user_message_id,
+                })
+                .block_task()
+                .await;
+            let suppress_abort_err = sessions
+                .borrow_mut()
+                .get_mut(&session_id)
+                .map(|session| std::mem::take(&mut session.suppress_abort_err))
+                .unwrap_or(false);
+            match result {
+                Ok(_) => Ok(()),
+                Err(error) if suppress_abort_err && is_abort_error(&error) => {
+                    Ok(())
+                }
+                Err(error) => Err(map_acp_error_with_details(error)),
+            }
+        })
+    }
+}
+
+fn is_abort_error(error: &acp::Error) -> bool {
+    if error.code != ErrorCode::InternalError {
+        return false;
+    }
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("details"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|details| {
+            details.contains("This operation was aborted")
+                || details.contains("The user aborted a request")
+        })
+}
+
+fn map_acp_error_with_details(error: acp::Error) -> anyhow::Error {
+    if error.code == ErrorCode::InternalError
+        && let Some(details) = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("details"))
+            .and_then(serde_json::Value::as_str)
+    {
+        return anyhow!(details.to_string());
+    }
+    map_acp_error(error)
 }
 
 impl AgentConnection for AcpConnection {
@@ -1929,64 +2143,47 @@ impl AgentConnection for AcpConnection {
         })
     }
 
+    fn client_user_message_ids(
+        &self,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionClientUserMessageIds>> {
+        self.supports_meta_capability(CLIENT_USER_MESSAGE_IDS_META_KEY)
+            .then(|| {
+                Rc::new(AcpClientUserMessageIds {
+                    connection: self.connection.clone(),
+                    sessions: self.sessions.clone(),
+                }) as Rc<dyn acp_thread::AgentSessionClientUserMessageIds>
+            })
+    }
+
     fn prompt(
         &self,
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
-        let conn = self.connection.clone();
-        let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
-        cx.foreground_executor().spawn(async move {
-            let result = conn.send_request(params).block_task().await;
+        send_prompt_request(
+            self.connection.clone(),
+            self.sessions.clone(),
+            session_id,
+            params,
+            cx,
+        )
+    }
 
-            let mut suppress_abort_err = false;
-
-            if let Some(session) = sessions.borrow_mut().get_mut(&session_id) {
-                suppress_abort_err = session.suppress_abort_err;
-                session.suppress_abort_err = false;
-            }
-
-            match result {
-                Ok(response) => Ok(response),
-                Err(err) => {
-                    if err.code == acp::ErrorCode::AuthRequired {
-                        return Err(anyhow!(acp::Error::auth_required()));
-                    }
-
-                    if err.code != ErrorCode::InternalError {
-                        anyhow::bail!(err)
-                    }
-
-                    let Some(data) = &err.data else {
-                        anyhow::bail!(err)
-                    };
-
-                    // Temporary workaround until the following PR is generally available:
-                    // https://github.com/google-gemini/gemini-cli/pull/6656
-
-                    #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
-                    struct ErrorDetails {
-                        details: Box<str>,
-                    }
-
-                    match serde_json::from_value(data.clone()) {
-                        Ok(ErrorDetails { details }) => {
-                            if suppress_abort_err
-                                && (details.contains("This operation was aborted")
-                                    || details.contains("The user aborted a request"))
-                            {
-                                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
-                            } else {
-                                Err(anyhow!(details))
-                            }
-                        }
-                        Err(_) => Err(anyhow!(err)),
-                    }
-                }
-            }
-        })
+    fn retry(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionRetry>> {
+        self.supports_meta_capability(SESSION_RETRY_META_KEY)
+            .then(|| {
+                Rc::new(AcpSessionRetry {
+                    connection: self.connection.clone(),
+                    sessions: self.sessions.clone(),
+                    session_id: session_id.clone(),
+                }) as Rc<dyn acp_thread::AgentSessionRetry>
+            })
     }
 
     fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
@@ -1999,6 +2196,21 @@ impl AgentConnection for AcpConnection {
 
     fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
         Some(self.request_elicitations.clone())
+    }
+
+    fn truncate(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionTruncate>> {
+        self.supports_meta_capability(SESSION_TRUNCATE_META_KEY)
+            .then(|| {
+                Rc::new(AcpSessionTruncate {
+                    connection: self.connection.clone(),
+                    sessions: self.sessions.clone(),
+                    session_id: session_id.clone(),
+                }) as Rc<dyn acp_thread::AgentSessionTruncate>
+            })
     }
 
     fn session_modes(
@@ -2686,6 +2898,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use agent_client_protocol::JsonRpcMessage as _;
     use feature_flags::FeatureFlag as _;
     use settings::Settings as _;
 
@@ -2991,6 +3204,96 @@ mod tests {
                 .session
                 .and_then(|session| session.config_options)
                 .and_then(|config_options| config_options.boolean)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn zed_session_editing_capabilities_are_explicitly_gated() {
+        let supported = acp::AgentCapabilities::new().meta(acp::Meta::from_iter([
+            (CLIENT_USER_MESSAGE_IDS_META_KEY.to_string(), true.into()),
+            (SESSION_RETRY_META_KEY.to_string(), true.into()),
+            (SESSION_TRUNCATE_META_KEY.to_string(), true.into()),
+        ]));
+        assert!(agent_supports_meta_capability(
+            &supported,
+            CLIENT_USER_MESSAGE_IDS_META_KEY
+        ));
+        assert!(agent_supports_meta_capability(
+            &supported,
+            SESSION_RETRY_META_KEY
+        ));
+        assert!(agent_supports_meta_capability(
+            &supported,
+            SESSION_TRUNCATE_META_KEY
+        ));
+        assert!(!agent_supports_meta_capability(
+            &acp::AgentCapabilities::default(),
+            SESSION_RETRY_META_KEY
+        ));
+    }
+
+    #[test]
+    fn zed_session_editing_requests_use_namespaced_wire_contract() {
+        let retry = RetrySessionRequest {
+            session_id: acp::SessionId::new("session-1"),
+        };
+        assert_eq!(retry.method(), "_zed/session/retry");
+
+        let truncate = TruncateSessionRequest {
+            session_id: acp::SessionId::new("session-1"),
+            client_user_message_id: acp_thread::ClientUserMessageId::new(),
+        };
+        assert_eq!(truncate.method(), "_zed/session/truncate");
+        let value = serde_json::to_value(truncate).expect("serialize truncate request");
+        assert_eq!(value["sessionId"], "session-1");
+        assert!(value["clientUserMessageId"].is_string());
+
+        let mut prompt = acp::PromptRequest::new(
+            acp::SessionId::new("session-1"),
+            vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))],
+        );
+        prompt.meta = Some(acp::Meta::from_iter([(
+            CLIENT_USER_MESSAGE_ID_META_KEY.to_string(),
+            "existing-id".into(),
+        )]));
+        let generated_id = acp_thread::ClientUserMessageId::new();
+        let generated_id_text = generated_id.as_str().to_string();
+        attach_client_user_message_id(&mut prompt, &generated_id);
+        assert_eq!(
+            prompt
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(CLIENT_USER_MESSAGE_ID_META_KEY)),
+            Some(&serde_json::json!(generated_id_text))
+        );
+    }
+
+    #[test]
+    fn zed_session_editing_recognizes_only_abort_errors() {
+        assert!(is_abort_error(
+            &acp::Error::internal_error().data(serde_json::json!({
+                "details": "This operation was aborted"
+            }))
+        ));
+        assert!(!is_abort_error(
+            &acp::Error::internal_error().data(serde_json::json!({
+                "details": "another failure"
+            }))
+        ));
+        assert!(!is_abort_error(&acp::Error::invalid_params()));
+        assert_eq!(
+            map_acp_error_with_details(
+                acp::Error::internal_error().data(serde_json::json!({
+                    "details": "specific failure"
+                }))
+            )
+            .to_string(),
+            "specific failure"
+        );
+        assert!(
+            map_acp_error_with_details(acp::Error::auth_required())
+                .downcast_ref::<AuthRequired>()
                 .is_some()
         );
     }

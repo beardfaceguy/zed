@@ -90,6 +90,11 @@ Open the [Agent Panel](./agent-panel.md), then use the agent selector or the new
 
 You can also create keybindings for specific agents with {#action agent::NewExternalAgentThread}.
 
+Retrying the latest response and editing an earlier user message are available
+when the external agent advertises Zed's capability-gated session-editing
+extension. Unsupported agents keep the existing behavior and do not show these
+actions.
+
 ## Configuration Boundaries {#configuration-boundaries}
 
 External Agents run as separate processes that communicate with Zed over ACP. This creates a boundary between Zed configuration and agent-native configuration.
