@@ -1087,6 +1087,9 @@ mod tests {
                     "always_allow": [
                         { "pattern": "^git\\s" }
                     ]
+                },
+                "external_agent:daimonos:tool:read_file": {
+                    "default": "allow"
                 }
             }
         });
@@ -1100,6 +1103,13 @@ mod tests {
         assert_eq!(terminal_rules.always_allow.len(), 1);
         assert!(terminal_rules.always_deny[0].is_match("rm -rf /"));
         assert!(terminal_rules.always_allow[0].is_match("git status"));
+        assert_eq!(
+            permissions
+                .tools
+                .get("external_agent:daimonos:tool:read_file")
+                .and_then(|rules| rules.default),
+            Some(ToolPermissionMode::Allow)
+        );
     }
 
     #[test]

@@ -1107,10 +1107,16 @@
     ],
     // Permission rules for tool actions.
     //
-    // The "default" setting applies when no tool-specific rules match.
-    // For external agents that define their own permission modes,
-    // "deny" and "confirm" still take precedence — the external agent's
-    // permission system is only used when Zed would allow the action.
+    // The top-level "default" and ordinary tool names apply to Zed's native
+    // agent. External ACP agents use reserved per-agent/per-tool keys:
+    // "external_agent:<agent-id>:tool:<tool-name>",
+    // "external_agent:<agent-id>:kind:<read|edit|delete|move|search|execute|think|fetch|switch_mode|other>",
+    // or "external_agent:<agent-id>:*" for an agent-wide default. Use `*`
+    // as the agent id for cross-agent fallbacks. All rules for a specific
+    // agent are evaluated before cross-agent fallbacks. External regex rules
+    // match compact raw-input JSON. Exact tool keys require ACP tool_name
+    // metadata; otherwise use a kind key. Scoped allow rules select only
+    // allow_once; they never persist broader approval inside the agent.
     //
     // Per-tool regex patterns ("tools" below) match against tool input text
     // (commands, paths, URLs, etc.). For `copy_path` and `move_path`,
@@ -1153,12 +1159,9 @@
     // entire current turn — ACP has no per-call cancel primitive. Leave
     // null to wait indefinitely.
     "external_agent_tool_timeout_seconds": null,
-    // When `true`, automatically approve every `session/request_permission`
-    // request raised by external ACP agents (e.g. Cursor, Claude Code,
-    // Gemini CLI) without showing a confirmation prompt. The `tool_permissions`
-    // rules above only apply to Zed's native agent — external agents own their
-    // own permission decisions. Use with care: this is the equivalent of
-    // running the external agent in a "yolo" / "always allow" mode.
+    // Backward-compatible fallback when no external-agent rule above matches.
+    // When `true`, automatically approve every external ACP permission request.
+    // Use with care: this is equivalent to a "yolo" / "always allow" mode.
     "always_allow_external_agent_tools": false,
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
