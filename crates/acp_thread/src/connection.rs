@@ -21,6 +21,10 @@ impl ClientUserMessageId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string().into())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
