@@ -1742,9 +1742,7 @@ impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
                 .unwrap_or(false);
             match result {
                 Ok(_) => Ok(()),
-                Err(error) if suppress_abort_err && is_abort_error(&error) => {
-                    Ok(())
-                }
+                Err(error) if suppress_abort_err && is_abort_error(&error) => Ok(()),
                 Err(error) => Err(map_acp_error_with_details(error)),
             }
         })
@@ -3271,23 +3269,21 @@ mod tests {
 
     #[test]
     fn zed_session_editing_recognizes_only_abort_errors() {
-        assert!(is_abort_error(
-            &acp::Error::internal_error().data(serde_json::json!({
+        assert!(is_abort_error(&acp::Error::internal_error().data(
+            serde_json::json!({
                 "details": "This operation was aborted"
-            }))
-        ));
-        assert!(!is_abort_error(
-            &acp::Error::internal_error().data(serde_json::json!({
+            })
+        )));
+        assert!(!is_abort_error(&acp::Error::internal_error().data(
+            serde_json::json!({
                 "details": "another failure"
-            }))
-        ));
+            })
+        )));
         assert!(!is_abort_error(&acp::Error::invalid_params()));
         assert_eq!(
-            map_acp_error_with_details(
-                acp::Error::internal_error().data(serde_json::json!({
-                    "details": "specific failure"
-                }))
-            )
+            map_acp_error_with_details(acp::Error::internal_error().data(serde_json::json!({
+                "details": "specific failure"
+            })))
             .to_string(),
             "specific failure"
         );
@@ -4575,9 +4571,7 @@ mod tests {
 
     fn selected_option_id(outcome: acp::RequestPermissionOutcome) -> String {
         match outcome {
-            acp::RequestPermissionOutcome::Selected(selected) => {
-                selected.option_id.0.to_string()
-            }
+            acp::RequestPermissionOutcome::Selected(selected) => selected.option_id.0.to_string(),
             acp::RequestPermissionOutcome::Cancelled => panic!("expected selected outcome"),
             _ => panic!("unexpected permission outcome"),
         }
@@ -4604,7 +4598,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Allow, true),
             &options,
         )
-            .expect("expected auto-approve outcome to be selected");
+        .expect("expected auto-approve outcome to be selected");
         assert_eq!(selected_option_id(outcome), "always");
     }
 
@@ -4633,7 +4627,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Allow, true),
             &options,
         )
-            .expect("expected auto-approve outcome to be selected");
+        .expect("expected auto-approve outcome to be selected");
         assert_eq!(selected_option_id(outcome), "once");
     }
 
@@ -4675,7 +4669,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Allow, true),
             &options,
         )
-            .expect("expected auto-approve outcome to be selected");
+        .expect("expected auto-approve outcome to be selected");
         assert_eq!(selected_option_id(outcome), "always_a");
     }
 
@@ -4690,7 +4684,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Deny, false),
             &options,
         )
-            .expect("expected automatic reject outcome");
+        .expect("expected automatic reject outcome");
         assert_eq!(selected_option_id(outcome), "reject_once");
     }
 
@@ -4789,13 +4783,8 @@ mod tests {
             input: String::new(),
         };
         assert_eq!(
-            external_permission_decision(
-                &permissions,
-                "daimonos",
-                Some(&wildcard_allowed),
-                false,
-            )
-            .mode,
+            external_permission_decision(&permissions, "daimonos", Some(&wildcard_allowed), false,)
+                .mode,
             settings::ToolPermissionMode::Deny,
             "agent-wide rule must precede cross-agent wildcard tool rule"
         );

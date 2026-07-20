@@ -102,9 +102,7 @@ impl ContextServerRegistry {
 
     pub fn rendered_instructions(&self) -> Option<String> {
         render_context_server_instructions(self.registered_servers.iter().filter_map(
-            |(server_id, server)| {
-                Some((server_id.0.as_ref(), server.instructions.as_deref()?))
-            },
+            |(server_id, server)| Some((server_id.0.as_ref(), server.instructions.as_deref()?)),
         ))
     }
 

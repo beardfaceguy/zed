@@ -857,6 +857,107 @@ fn test_extending_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_extend_selection_after_collapsed_word_selection(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("aaa bbb ccc ddd eee", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        // Double-click "bbb" to select it word-wise.
+        editor.begin_selection(DisplayPoint::new(DisplayRow(0), 5), false, 2, window, cx);
+        editor.end_selection(window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(0), 4)..DisplayPoint::new(DisplayRow(0), 7)]
+        );
+
+        // Move the cursor with the keyboard, collapsing the selection.
+        editor.move_right(&MoveRight, window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(0), 7)..DisplayPoint::new(DisplayRow(0), 7)]
+        );
+
+        // Shift+click further along the line should extend from the cursor,
+        // not from the stale double-clicked word.
+        editor.extend_selection(DisplayPoint::new(DisplayRow(0), 10), 1, window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(0), 7)..DisplayPoint::new(DisplayRow(0), 10)]
+        );
+    });
+}
+
+#[gpui::test]
+fn test_extend_selection_after_collapsed_word_selection_moved_via_offsets(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("aaa bbb ccc ddd eee", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        // Double-click "bbb" to select it word-wise.
+        editor.begin_selection(DisplayPoint::new(DisplayRow(0), 5), false, 2, window, cx);
+        editor.end_selection(window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(0), 4)..DisplayPoint::new(DisplayRow(0), 7)]
+        );
+
+        // Collapse the selection through `move_offsets_with`, the code path
+        // used by non-keyboard-movement callers like
+        // `move_to_enclosing_bracket` and `select_delimiters_impl`.
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.move_offsets_with(&mut |_, selection| {
+                selection.collapse_to(MultiBufferOffset(7), SelectionGoal::None);
+            });
+        });
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(0), 7)..DisplayPoint::new(DisplayRow(0), 7)]
+        );
+
+        // Shift+click further along the line should extend from the cursor,
+        // not from the stale double-clicked word.
+        editor.extend_selection(DisplayPoint::new(DisplayRow(0), 10), 1, window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(0), 7)..DisplayPoint::new(DisplayRow(0), 10)]
+        );
+    });
+}
+
+#[gpui::test]
+fn test_extend_selection_from_empty_line_selection(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("aaa\nbbb\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.begin_selection(DisplayPoint::new(DisplayRow(2), 0), false, 3, window, cx);
+        editor.end_selection(window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(2), 0)..DisplayPoint::new(DisplayRow(2), 0)]
+        );
+
+        editor.extend_selection(DisplayPoint::new(DisplayRow(0), 1), 1, window, cx);
+        assert_eq!(
+            display_ranges(editor, cx),
+            [DisplayPoint::new(DisplayRow(2), 0)..DisplayPoint::new(DisplayRow(0), 0)]
+        );
+    });
+}
+
+#[gpui::test]
 fn test_clone(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -2482,6 +2583,45 @@ fn test_beginning_of_line_single_line_editor(cx: &mut TestAppContext) {
             display_ranges(editor, cx),
             &[DisplayPoint::new(DisplayRow(0), 10)..DisplayPoint::new(DisplayRow(0), 0)]
         );
+    });
+}
+
+#[gpui::test]
+fn test_only_focused_editor_blinks_across_window_activation(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let window = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    let unfocused_editor = window
+        .update(cx, |focused_editor, window, cx| {
+            window.focus(&focused_editor.focus_handle(cx), cx);
+            let unfocused_editor = cx.new(|cx| Editor::single_line(window, cx));
+            window.activate_window();
+            unfocused_editor
+        })
+        .unwrap();
+    let focused_editor = window.root(cx).unwrap();
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        assert!(window.is_window_active());
+        assert!(focused_editor.read(cx).blink_manager.read(cx).enabled());
+        assert!(!unfocused_editor.read(cx).blink_manager.read(cx).enabled());
+    });
+
+    cx.deactivate_window();
+    cx.update(|window, cx| {
+        assert!(!window.is_window_active());
+        assert!(!focused_editor.read(cx).blink_manager.read(cx).enabled());
+        assert!(!unfocused_editor.read(cx).blink_manager.read(cx).enabled());
+    });
+
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(window.is_window_active());
+        assert!(focused_editor.read(cx).blink_manager.read(cx).enabled());
+        assert!(!unfocused_editor.read(cx).blink_manager.read(cx).enabled());
     });
 }
 
@@ -6539,6 +6679,24 @@ async fn test_join_lines_strips_comment_prefix(cx: &mut TestAppContext) {
         cx.update_editor(|e, window, cx| e.join_lines(&JoinLines, window, cx));
         cx.assert_editor_state(indoc! {"
             + fooˇ bar
+        "});
+
+        cx.set_state(indoc! {"
+            fooˇ
+            *bar*
+        "});
+        cx.update_editor(|e, window, cx| e.join_lines(&JoinLines, window, cx));
+        cx.assert_editor_state(indoc! {"
+            fooˇ *bar*
+        "});
+
+        cx.set_state(indoc! {"
+            * ˇfoo
+            *
+        "});
+        cx.update_editor(|e, window, cx| e.join_lines(&JoinLines, window, cx));
+        cx.assert_editor_state(indoc! {"
+            * fooˇ
         "});
 
         // No-whitespace join also strips the list marker.
@@ -12651,9 +12809,9 @@ async fn test_fold_function_bodies(cx: &mut TestAppContext) {
             fn b() {
                 c();
             }
-      -
-      -     // this is another uncommitted comment
 
+      -     // this is another uncommitted comment
+      -
             fn d() {
                 // e
                 // f
@@ -26491,6 +26649,57 @@ async fn test_diff_base_change_with_expanded_diff_hunks(
         +     //
         +     //
         + }
+        "#
+        .unindent(),
+    );
+}
+
+#[gpui::test]
+async fn test_go_to_singleton_buffer_point_with_expanded_deleted_hunks(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    let diff_base = r#"
+        removed line 1
+        removed line 2
+        line 1
+        line 2
+        line 3
+        "#
+    .unindent();
+
+    cx.set_state(
+        &r#"
+        ˇline 1
+        line 2
+        line 3
+        "#
+        .unindent(),
+    );
+
+    cx.set_head_text(&diff_base);
+    executor.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&ExpandAllDiffHunks, window, cx);
+    });
+    executor.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.go_to_singleton_buffer_point(Point::new(2, 0), window, cx);
+    });
+
+    cx.assert_state_with_diff(
+        r#"
+        - removed line 1
+        - removed line 2
+          line 1
+          line 2
+          ˇline 3
         "#
         .unindent(),
     );

@@ -693,14 +693,14 @@ mod tests {
     #[gpui::test]
     async fn request_times_out_when_server_is_silent(cx: &mut TestAppContext) {
         init_test(cx);
-        let transport =
-            Arc::new(create_fake_transport("silent-server", cx.executor()));
+        let transport = Arc::new(create_fake_transport("silent-server", cx.executor()));
         let client = new_test_client(cx, transport.clone());
 
         let request: Task<anyhow::Result<serde_json::Value>> =
             cx.spawn(async move |_| client.request("tools/call", json!({"name": "slow"})).await);
 
-        cx.executor().advance_clock(TEST_TIMEOUT + Duration::from_secs(1));
+        cx.executor()
+            .advance_clock(TEST_TIMEOUT + Duration::from_secs(1));
         let result = request.await;
         assert!(
             result.is_err(),
@@ -709,12 +709,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn progress_notifications_keep_request_alive_past_timeout(
-        cx: &mut TestAppContext,
-    ) {
+    async fn progress_notifications_keep_request_alive_past_timeout(cx: &mut TestAppContext) {
         init_test(cx);
-        let transport =
-            Arc::new(create_fake_transport("progress-emitter", cx.executor()));
+        let transport = Arc::new(create_fake_transport("progress-emitter", cx.executor()));
         let client = new_test_client(cx, transport.clone());
 
         let request_transport = transport.clone();
@@ -723,7 +720,9 @@ mod tests {
             // Park until the client has actually emitted the request so the
             // FakeTransport has registered the in-flight call before we start
             // injecting progress.
-            cx.background_executor().timer(Duration::from_millis(1)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
             // Fire-and-forget the response after the test pumps the clock
             // past what would have been the original timeout.
             let _ = request_transport;
@@ -794,7 +793,8 @@ mod tests {
         // ...then go silent for longer than the timeout. The request must
         // bail out once the silence gap exceeds the configured threshold,
         // even though earlier activity reset the timer.
-        cx.executor().advance_clock(TEST_TIMEOUT + Duration::from_secs(1));
+        cx.executor()
+            .advance_clock(TEST_TIMEOUT + Duration::from_secs(1));
         let result = request.await;
         assert!(
             result.is_err(),
