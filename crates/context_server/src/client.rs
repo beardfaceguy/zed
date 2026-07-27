@@ -57,8 +57,7 @@ pub(crate) struct Client {
     #[allow(clippy::type_complexity)]
     #[allow(dead_code)]
     io_tasks: Mutex<Option<(Task<Option<()>>, Task<Option<()>>)>>,
-    input_done_rx: Mutex<Option<barrier::Receiver>>,
-    output_done_rx: Mutex<Option<barrier::Receiver>>,
+    shutdown_rx: Mutex<Option<(barrier::Receiver, barrier::Receiver)>>,
     executor: BackgroundExecutor,
     transport: Arc<dyn Transport>,
     request_timeout: Option<Duration>,
@@ -287,8 +286,7 @@ impl Client {
             outbound_tx,
             executor: cx.background_executor().clone(),
             io_tasks: Mutex::new(Some((input_task, output_task))),
-            input_done_rx: Mutex::new(Some(input_done_rx)),
-            output_done_rx: Mutex::new(Some(output_done_rx)),
+            shutdown_rx: Mutex::new(Some((input_done_rx, output_done_rx))),
             transport,
             request_timeout,
             last_transport_error,
@@ -402,8 +400,7 @@ impl Client {
     pub(crate) fn wait_for_shutdown(
         &self,
     ) -> Option<future::BoxFuture<'static, TransportShutdown>> {
-        let mut input_done = self.input_done_rx.lock().take()?;
-        let mut output_done = self.output_done_rx.lock().take()?;
+        let (mut input_done, mut output_done) = self.shutdown_rx.lock().take()?;
         let transport = self.transport.clone();
         let shutdown_reason = self.shutdown_reason.clone();
         Some(
@@ -734,6 +731,10 @@ mod tests {
         let shutdown = client
             .wait_for_shutdown()
             .expect("client must expose one shutdown signal");
+        assert!(
+            client.wait_for_shutdown().is_none(),
+            "shutdown receivers must be claimed atomically and only once"
+        );
 
         transport.disconnect();
         let shutdown = shutdown.await;
