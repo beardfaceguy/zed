@@ -57,6 +57,7 @@ pub(crate) struct Client {
     #[allow(clippy::type_complexity)]
     #[allow(dead_code)]
     io_tasks: Mutex<Option<(Task<Option<()>>, Task<Option<()>>)>>,
+    input_done_rx: Mutex<Option<barrier::Receiver>>,
     output_done_rx: Mutex<Option<barrier::Receiver>>,
     executor: BackgroundExecutor,
     transport: Arc<dyn Transport>,
@@ -77,6 +78,13 @@ pub(crate) struct Client {
     /// authentication challenges are observed via [`Self::wait_for_shutdown`]
     /// and [`Transport::auth_challenge`], which do not involve requests.
     last_transport_error: Arc<Mutex<Option<anyhow::Error>>>,
+    shutdown_reason: Arc<Mutex<Option<Arc<str>>>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TransportShutdown {
+    AuthenticationRequired(WwwAuthenticate),
+    Disconnected(Arc<str>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -206,6 +214,7 @@ impl Client {
         cx: AsyncApp,
     ) -> Result<Self> {
         let (outbound_tx, outbound_rx) = async_channel::unbounded::<String>();
+        let (input_done_tx, input_done_rx) = barrier::channel();
         let (output_done_tx, output_done_rx) = barrier::channel();
 
         let subscription_set = Arc::new(Mutex::new(NotificationSubscriptionSet::default()));
@@ -213,15 +222,18 @@ impl Client {
             Arc::new(Mutex::new(Some(HashMap::<_, ResponseHandler>::default())));
         let request_handlers = Arc::new(Mutex::new(HashMap::<_, RequestHandler>::default()));
         let inbound_activity_at = Arc::new(Mutex::new(cx.background_executor().now()));
+        let shutdown_reason = Arc::new(Mutex::new(None));
 
         let receive_input_task = cx.spawn({
+            let server_id = server_id.clone();
             let subscription_set = subscription_set.clone();
             let response_handlers = response_handlers.clone();
             let request_handlers = request_handlers.clone();
             let transport = transport.clone();
             let inbound_activity_at = inbound_activity_at.clone();
+            let shutdown_reason = shutdown_reason.clone();
             async move |cx| {
-                Self::handle_input(
+                let result = Self::handle_input(
                     transport,
                     subscription_set,
                     request_handlers,
@@ -229,8 +241,16 @@ impl Client {
                     inbound_activity_at,
                     cx,
                 )
-                .log_err()
-                .await
+                .await;
+                let reason = match &result {
+                    Ok(()) => format!("Context server `{server_id}` closed its output stream"),
+                    Err(error) => {
+                        format!("Context server `{server_id}` input failed: {error:#}")
+                    }
+                };
+                *shutdown_reason.lock() = Some(reason.into());
+                drop(input_done_tx);
+                result.log_err()
             }
         });
         let receive_err_task = cx.spawn({
@@ -246,12 +266,14 @@ impl Client {
         let output_task = cx.background_spawn({
             let transport = transport.clone();
             let last_transport_error = last_transport_error.clone();
+            let shutdown_reason = shutdown_reason.clone();
             Self::handle_output(
                 transport,
                 outbound_rx,
                 output_done_tx,
                 response_handlers.clone(),
                 last_transport_error,
+                shutdown_reason,
             )
             .log_err()
         });
@@ -265,10 +287,12 @@ impl Client {
             outbound_tx,
             executor: cx.background_executor().clone(),
             io_tasks: Mutex::new(Some((input_task, output_task))),
+            input_done_rx: Mutex::new(Some(input_done_rx)),
             output_done_rx: Mutex::new(Some(output_done_rx)),
             transport,
             request_timeout,
             last_transport_error,
+            shutdown_reason,
             inbound_activity_at,
         })
     }
@@ -348,6 +372,7 @@ impl Client {
         output_done_tx: barrier::Sender,
         response_handlers: Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
         last_transport_error: Arc<Mutex<Option<anyhow::Error>>>,
+        shutdown_reason: Arc<Mutex<Option<Arc<str>>>>,
     ) -> anyhow::Result<()> {
         let _clear_response_handlers = util::defer({
             let response_handlers = response_handlers.clone();
@@ -359,6 +384,7 @@ impl Client {
             log::trace!("outgoing message: {}", message);
             if let Err(err) = transport.send(message).await {
                 log::debug!("transport send failed: {:#}", err);
+                *shutdown_reason.lock() = Some(format!("{err:#}").into());
                 *last_transport_error.lock() = Some(err);
                 return Ok(());
             }
@@ -367,23 +393,33 @@ impl Client {
         Ok(())
     }
 
-    /// A future that resolves once the transport's output loop has terminated
-    /// — after a send failure, or when this client is dropped — yielding the
-    /// authentication challenge recorded by the transport if it shut down on a
-    /// `401 Unauthorized` response.
+    /// A future that resolves once either side of the transport has terminated,
+    /// yielding an authentication challenge or the transport failure reason.
     ///
     /// Unlike `last_transport_error`, this does not require a request to be in
     /// flight when the transport fails. Returns `None` if the shutdown signal
     /// was already claimed: there is a single signal per client.
     pub(crate) fn wait_for_shutdown(
         &self,
-    ) -> Option<future::BoxFuture<'static, Option<WwwAuthenticate>>> {
+    ) -> Option<future::BoxFuture<'static, TransportShutdown>> {
+        let mut input_done = self.input_done_rx.lock().take()?;
         let mut output_done = self.output_done_rx.lock().take()?;
         let transport = self.transport.clone();
+        let shutdown_reason = self.shutdown_reason.clone();
         Some(
             async move {
-                output_done.recv().await;
-                transport.auth_challenge()
+                let input_done = input_done.recv().boxed();
+                let output_done = output_done.recv().boxed();
+                future::select(input_done, output_done).await;
+                if let Some(challenge) = transport.auth_challenge() {
+                    TransportShutdown::AuthenticationRequired(challenge)
+                } else {
+                    let reason = shutdown_reason
+                        .lock()
+                        .clone()
+                        .unwrap_or_else(|| "Context server transport closed".into());
+                    TransportShutdown::Disconnected(reason)
+                }
             }
             .boxed(),
         )
@@ -688,6 +724,29 @@ mod tests {
             )
             .expect("Client construction should succeed")
         })
+    }
+
+    #[gpui::test]
+    async fn input_eof_reports_transport_shutdown(cx: &mut TestAppContext) {
+        init_test(cx);
+        let transport = Arc::new(create_fake_transport("exiting-server", cx.executor()));
+        let client = new_test_client(cx, transport.clone());
+        let shutdown = client
+            .wait_for_shutdown()
+            .expect("client must expose one shutdown signal");
+
+        transport.disconnect();
+        let shutdown = shutdown.await;
+
+        match shutdown {
+            TransportShutdown::Disconnected(reason) => {
+                assert!(reason.contains("closed its output stream"));
+                assert!(reason.contains("test"));
+            }
+            TransportShutdown::AuthenticationRequired(_) => {
+                panic!("input EOF must not be reported as an authentication challenge");
+            }
+        }
     }
 
     #[gpui::test]
