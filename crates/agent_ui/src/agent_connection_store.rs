@@ -225,6 +225,24 @@ impl AgentConnectionStore {
                     })
                     .ok();
 
+                    cx.spawn({
+                        let this = this.clone();
+                        let key = key.clone();
+                        let entry = entry.clone();
+                        async move |cx| {
+                            cx.background_executor()
+                                .timer(STABLE_CONNECTION_DURATION)
+                                .await;
+                            this.update(cx, |this, _cx| {
+                                if this.entries.get(&key) == entry.upgrade().as_ref() {
+                                    this.restart_backoffs.remove(&key);
+                                }
+                            })
+                            .ok();
+                        }
+                    })
+                    .detach();
+
                     let Some(mut retirement) = retirement else {
                         return;
                     };
@@ -526,7 +544,7 @@ mod tests {
         server.simulate_server_exit();
         cx.run_until_parked();
         let third_entry = store.update(cx, |store, cx| {
-            store.request_connection(key, server.clone(), cx)
+            store.request_connection(key.clone(), server.clone(), cx)
         });
         cx.run_until_parked();
         cx.executor().advance_clock(INITIAL_RESTART_DELAY);
@@ -543,10 +561,39 @@ mod tests {
         });
         assert_eq!(connect_count.load(Ordering::SeqCst), 3);
 
+        cx.executor()
+            .advance_clock(STABLE_CONNECTION_DURATION + Duration::from_secs(1));
+        cx.run_until_parked();
+        let fourth_entry = store.update(cx, |store, cx| {
+            store.restart_connection(key.clone(), server.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(connect_count.load(Ordering::SeqCst), 4);
+
+        server.simulate_server_exit();
+        cx.run_until_parked();
+        let fifth_entry = store.update(cx, |store, cx| {
+            store.request_connection(key, server.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(connect_count.load(Ordering::SeqCst), 4);
+        cx.executor().advance_clock(INITIAL_RESTART_DELAY);
+        cx.run_until_parked();
+        fifth_entry.read_with(cx, |entry, _cx| {
+            assert!(matches!(entry, AgentConnectionEntry::Connected(_)));
+        });
+        assert_eq!(
+            connect_count.load(Ordering::SeqCst),
+            5,
+            "a stable connection must reset the crash-loop backoff"
+        );
+
         drop(first_connection);
         drop(first_entry);
         drop(second_entry);
         drop(third_entry);
+        drop(fourth_entry);
+        drop(fifth_entry);
         drop(store);
         drop(project);
         drop(server);
