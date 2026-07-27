@@ -15,7 +15,7 @@ use async_channel;
 use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
-use futures::future::Shared;
+use futures::future::{LocalBoxFuture, Shared};
 use futures::io::BufReader;
 use futures::{AsyncBufReadExt as _, Future, FutureExt as _, StreamExt as _};
 use project::agent_server_store::{
@@ -962,19 +962,14 @@ impl AcpConnection {
             connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
         let (retirement_tx, retirement_rx) = watch::channel(None);
         let retirement_tx = Arc::new(Mutex::new(Some(retirement_tx)));
-        let retirement_executor = cx.background_executor().clone();
-        let io_task = cx.background_spawn({
-            let agent_id = agent_id.clone();
-            let retirement_tx = retirement_tx.clone();
-            async move {
-                let load_error = match connection_future.await {
-                    Ok(()) => LoadError::Other("ACP transport closed".into()),
-                    Err(error) => LoadError::Other(format!("ACP transport failed: {error}").into()),
-                };
-                // Process exit and pipe closure wake together; prefer the status
-                // watcher so existing sessions retain the concrete exit status.
-                retirement_executor.timer(TRANSPORT_RETIREMENT_DELAY).await;
-                retire_acp_connection(&agent_id, &retirement_tx, load_error);
+        let (transport_retirement_tx, transport_retirement_rx) = async_channel::bounded(1);
+        let io_task = cx.background_spawn(async move {
+            let load_error = match connection_future.await {
+                Ok(()) => LoadError::Other("ACP transport closed".into()),
+                Err(error) => LoadError::Other(format!("ACP transport failed: {error}").into()),
+            };
+            if transport_retirement_tx.send(load_error).await.is_err() {
+                log::debug!("ACP transport retirement receiver was dropped");
             }
         });
 
@@ -1058,12 +1053,21 @@ impl AcpConnection {
         let wait_task = cx.spawn({
             let agent_id = agent_id.clone();
             let retirement_tx = retirement_tx.clone();
-            async move |_cx| {
-                let load_error = match status_fut.await {
-                    Ok(load_error) => load_error,
-                    Err(error) => LoadError::Other(error.to_string().into()),
-                };
+            async move |cx| {
+                let (load_error, pending_status) = select_retirement_error(
+                    status_fut,
+                    transport_retirement_rx,
+                    cx.background_executor().clone(),
+                )
+                .await;
                 retire_acp_connection(&agent_id, &retirement_tx, load_error);
+                if let Some(status) = pending_status
+                    && let Err(error) = status.await
+                {
+                    log::warn!(
+                        "failed to collect agent server exit after transport retirement: {error}"
+                    );
+                }
                 Ok(())
             }
         });
@@ -1209,14 +1213,11 @@ impl AcpConnection {
     }
 
     fn retirement_error(&self) -> Option<AcpConnectionRetired> {
-        let reason = {
-            let mut retirement_rx = self.retirement_rx.clone();
-            let reason = retirement_rx.borrow().clone();
-            reason
-        }?;
+        let mut retirement_rx = self.retirement_rx.clone();
+        let reason = retirement_rx.borrow().clone();
         Some(AcpConnectionRetired {
             agent_id: self.id.clone(),
-            reason,
+            reason: reason?,
         })
     }
 
@@ -1618,6 +1619,45 @@ fn retire_acp_connection(
 
     log::error!("ACP connection for agent `{agent_id}` retired: {error}");
     retirement_tx.send(Some(error)).log_err();
+}
+
+fn child_status_load_error(status: Result<LoadError>) -> LoadError {
+    match status {
+        Ok(load_error) => load_error,
+        Err(error) => LoadError::Other(error.to_string().into()),
+    }
+}
+
+async fn select_retirement_error(
+    status_fut: LocalBoxFuture<'static, Result<LoadError>>,
+    transport_retirement_rx: async_channel::Receiver<LoadError>,
+    executor: gpui::BackgroundExecutor,
+) -> (
+    LoadError,
+    Option<LocalBoxFuture<'static, Result<LoadError>>>,
+) {
+    let transport_retirement = transport_retirement_rx.recv().boxed_local();
+    match futures::future::select(status_fut, transport_retirement).await {
+        futures::future::Either::Left((status, _transport_retirement)) => {
+            (child_status_load_error(status), None)
+        }
+        futures::future::Either::Right((transport_error, status_fut)) => {
+            let Ok(transport_error) = transport_error else {
+                return (child_status_load_error(status_fut.await), None);
+            };
+            let timer = executor.timer(TRANSPORT_RETIREMENT_DELAY).boxed_local();
+            match futures::future::select(status_fut, timer).await {
+                futures::future::Either::Left((status, _timer)) => {
+                    (child_status_load_error(status), None)
+                }
+                futures::future::Either::Right(((), status_fut)) => {
+                    // Retire the unusable transport now, but preserve the status
+                    // future so the child is still collected when it exits.
+                    (transport_error, Some(status_fut))
+                }
+            }
+        }
+    }
 }
 
 async fn emit_retirement_to_all_sessions(
@@ -3043,6 +3083,81 @@ mod tests {
             cx.set_global(settings_store);
             cx.update_flags(false, vec![]);
         });
+    }
+
+    #[gpui::test]
+    async fn child_status_wins_during_transport_retirement_grace(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (transport_tx, transport_rx) = async_channel::bounded(1);
+        transport_tx
+            .send(LoadError::Other("transport".into()))
+            .await
+            .expect("transport retirement receiver should be alive");
+        let executor = cx.executor();
+        let status_executor = executor.clone();
+        let status = async move {
+            status_executor
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            Ok(LoadError::Other("status".into()))
+        }
+        .boxed_local();
+        let task =
+            cx.spawn(async move |_| select_retirement_error(status, transport_rx, executor).await);
+
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        let (error, pending_status) = task.await;
+
+        assert!(pending_status.is_none());
+        assert!(matches!(
+            error,
+            LoadError::Other(message) if message.as_ref() == "status"
+        ));
+    }
+
+    #[gpui::test]
+    async fn transport_retires_after_grace_but_child_status_remains_awaited(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (transport_tx, transport_rx) = async_channel::bounded(1);
+        transport_tx
+            .send(LoadError::Other("transport".into()))
+            .await
+            .expect("transport retirement receiver should be alive");
+        let executor = cx.executor();
+        let status_executor = executor.clone();
+        let status = async move {
+            status_executor
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            Ok(LoadError::Other("status".into()))
+        }
+        .boxed_local();
+        let task =
+            cx.spawn(async move |_| select_retirement_error(status, transport_rx, executor).await);
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(TRANSPORT_RETIREMENT_DELAY);
+        let (error, pending_status) = task.await;
+        assert!(matches!(
+            error,
+            LoadError::Other(message) if message.as_ref() == "transport"
+        ));
+
+        let pending_status =
+            pending_status.expect("child status must remain pending so the process is reaped");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        let status = pending_status
+            .await
+            .expect("child status should remain awaitable after transport retirement");
+        assert!(matches!(
+            status,
+            LoadError::Other(message) if message.as_ref() == "status"
+        ));
     }
 
     #[gpui::test]
