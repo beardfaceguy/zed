@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+temp_dir="$(mktemp -d)"
+trap 'rm -rf "$temp_dir"' EXIT
+
+test_repo="$temp_dir/repo"
+fake_bin="$temp_dir/bin"
+hook_log="$temp_dir/hooks.log"
+mkdir -p "$test_repo/.hooks" "$test_repo/script" "$fake_bin"
+
+cp "$repo_root/.hooks/pre-commit" "$test_repo/.hooks/pre-commit"
+cp "$repo_root/.hooks/pre-push" "$test_repo/.hooks/pre-push"
+cp "$repo_root/script/install-hooks" "$test_repo/script/install-hooks"
+cp "$repo_root/script/security-scan" "$test_repo/script/security-scan"
+
+for tool in ruff shellcheck gitleaks semgrep osv-scanner; do
+    cat > "$fake_bin/$tool" <<'EOF'
+#!/usr/bin/env bash
+printf '%s %s\n' "${0##*/}" "$*" >> "$HOOK_TEST_LOG"
+EOF
+    chmod +x "$fake_bin/$tool"
+done
+
+git -C "$test_repo" init -q
+git -C "$test_repo" config user.name "Hook Test"
+git -C "$test_repo" config user.email "hook-test@example.com"
+printf 'print("ok")\n' > "$test_repo/check.py"
+printf '#!/usr/bin/env bash\ntrue\n' > "$test_repo/check.sh"
+printf 'unchanged\n' > "$test_repo/notes.txt"
+git -C "$test_repo" add .
+git -C "$test_repo" commit -qm "baseline"
+
+printf 'print("changed")\n' > "$test_repo/check.py"
+printf '#!/usr/bin/env bash\nprintf "changed\\n"\n' > "$test_repo/check.sh"
+git -C "$test_repo" add check.py check.sh
+
+(
+    cd "$test_repo"
+    PATH="$fake_bin:$PATH" HOOK_TEST_LOG="$hook_log" \
+        bash .hooks/pre-commit
+)
+
+grep -F "gitleaks git --pre-commit --redact --staged --verbose" "$hook_log"
+grep -F "ruff check --select F,E7 --output-format=concise -- check.py" "$hook_log"
+grep -F "shellcheck -x -S error -- check.sh" "$hook_log"
+
+: > "$hook_log"
+(
+    cd "$test_repo"
+    PATH="$fake_bin:$PATH" HOOK_TEST_LOG="$hook_log" \
+        bash .hooks/pre-push origin https://github.com/example/repo
+)
+
+grep -F "semgrep scan --config p/rust --config p/python --config p/javascript" "$hook_log"
+grep -F "osv-scanner scan source --recursive --verbosity=error" "$hook_log"
+
+printf '#!/usr/bin/env bash\nprintf "existing\\n"\n' > "$test_repo/.git/hooks/pre-commit"
+if (
+    cd "$test_repo"
+    PATH="$fake_bin:$PATH" bash script/install-hooks
+); then
+    printf 'installer unexpectedly replaced an existing hook\n' >&2
+    exit 1
+fi
+grep -F 'printf "existing\n"' "$test_repo/.git/hooks/pre-commit"
+rm "$test_repo/.git/hooks/pre-commit"
+
+(
+    cd "$test_repo"
+    PATH="$fake_bin:$PATH" bash script/install-hooks
+)
+test "$(readlink "$test_repo/.git/hooks/pre-commit")" = "$test_repo/.hooks/pre-commit"
+test "$(readlink "$test_repo/.git/hooks/pre-push")" = "$test_repo/.hooks/pre-push"
+(
+    cd "$test_repo"
+    PATH="$fake_bin:$PATH" bash script/install-hooks
+)
+
+printf 'git hook tests passed\n'

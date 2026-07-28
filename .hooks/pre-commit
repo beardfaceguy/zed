@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+require_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'pre-commit: required tool `%s` is not installed; run ./script/install-hooks for setup instructions\n' "$1" >&2
+        exit 1
+    fi
+}
+
+staged_files=()
+while IFS= read -r -d '' path; do
+    staged_files+=("$path")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if (( ${#staged_files[@]} == 0 )); then
+    exit 0
+fi
+
+require_tool gitleaks
+printf 'pre-commit: scanning staged changes for secrets\n'
+gitleaks git --pre-commit --redact --staged --verbose
+
+python_files=()
+shell_files=()
+for path in "${staged_files[@]}"; do
+    [[ -f "$path" ]] || continue
+    case "$path" in
+        *.py)
+            python_files+=("$path")
+            ;;
+    esac
+
+    case "$path" in
+        *.sh|*.bash|*.dash)
+            shell_files+=("$path")
+            ;;
+        *)
+            first_line=""
+            IFS= read -r first_line < "$path" || true
+            if [[ "$first_line" =~ ^\#!.*(/|env[[:space:]]+)(ba|da)?sh([[:space:]]|$) ]]; then
+                shell_files+=("$path")
+            fi
+            ;;
+    esac
+done
+
+if (( ${#python_files[@]} > 0 )); then
+    require_tool ruff
+    printf 'pre-commit: linting %d staged Python file(s)\n' "${#python_files[@]}"
+    ruff check --select F,E7 --output-format=concise -- "${python_files[@]}"
+fi
+
+if (( ${#shell_files[@]} > 0 )); then
+    require_tool shellcheck
+    printf 'pre-commit: linting %d staged shell file(s)\n' "${#shell_files[@]}"
+    shellcheck -x -S error -- "${shell_files[@]}"
+fi
+
+printf 'pre-commit: guards passed\n'

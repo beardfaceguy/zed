@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+if [[ "${SKIP_SECURITY_SCAN:-0}" == "1" ]]; then
+    printf 'pre-push: security scan skipped by SKIP_SECURITY_SCAN=1\n' >&2
+    exit 0
+fi
+
+if [[ "${ENFORCE_SECURITY_SCAN:-0}" == "1" ]]; then
+    exec "$repo_root/script/security-scan"
+else
+    exec "$repo_root/script/security-scan" --advisory
+fi

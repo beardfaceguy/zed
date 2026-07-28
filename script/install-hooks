@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if (( $# > 0 )); then
+    printf 'Usage: %s\n' "${0##*/}" >&2
+    exit 2
+fi
+
+missing_tools=()
+for tool in gitleaks ruff shellcheck semgrep osv-scanner; do
+    command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
+done
+if (( ${#missing_tools[@]} > 0 )); then
+    printf 'install-hooks: missing required tool(s): %s\n' "${missing_tools[*]}" >&2
+    printf '%s\n' \
+        '  ruff:        pipx install ruff, uv tool install ruff, or your package manager' \
+        '  shellcheck:  apt install shellcheck or brew install shellcheck' \
+        '  gitleaks:    https://github.com/gitleaks/gitleaks#installing' \
+        '  semgrep:     pipx install semgrep, uv tool install semgrep, or brew install semgrep' \
+        '  osv-scanner: https://google.github.io/osv-scanner/installation/' >&2
+    exit 1
+fi
+
+hooks_dir="$(git rev-parse --git-path hooks)"
+[[ "$hooks_dir" == /* ]] || hooks_dir="$repo_root/$hooks_dir"
+
+for hook_name in pre-commit pre-push; do
+    source_hook="$repo_root/.hooks/$hook_name"
+    installed_hook="$hooks_dir/$hook_name"
+    if [[ -L "$installed_hook" ]] \
+        && [[ "$(readlink "$installed_hook")" == "$source_hook" ]]; then
+        continue
+    fi
+    if [[ -e "$installed_hook" || -L "$installed_hook" ]]; then
+        printf 'install-hooks: refusing to replace existing hook: %s\n' "$installed_hook" >&2
+        printf 'install-hooks: preserve or compose that hook manually, then rerun\n' >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$hooks_dir"
+for hook_name in pre-commit pre-push; do
+    source_hook="$repo_root/.hooks/$hook_name"
+    installed_hook="$hooks_dir/$hook_name"
+    if [[ ! -L "$installed_hook" ]]; then
+        ln -s "$source_hook" "$installed_hook"
+        printf 'install-hooks: installed %s\n' "$installed_hook"
+    fi
+done
+
+printf 'install-hooks: pre-commit and pre-push guards are active\n'
