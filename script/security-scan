@@ -25,6 +25,19 @@ require_tool() {
 require_tool semgrep
 require_tool osv-scanner
 
+run_with_timeout() {
+    local duration="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground "$duration" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout --foreground "$duration" "$@"
+    else
+        printf 'security-scan: warning: timeout/gtimeout unavailable; running without a whole-scan timeout\n' >&2
+        "$@"
+    fi
+}
+
 git_dir="$(git rev-parse --git-dir)"
 [[ "$git_dir" == /* ]] || git_dir="$repo_root/$git_dir"
 report_dir="$git_dir/security-reports"
@@ -33,10 +46,11 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 semgrep_report="$report_dir/semgrep-$timestamp.json"
 semgrep_log="$report_dir/semgrep-$timestamp.log"
 osv_report="$report_dir/osv-$timestamp.json"
+osv_log="$report_dir/osv-$timestamp.log"
 
 printf 'security-scan: running Semgrep; reports: %s and %s\n' "$semgrep_report" "$semgrep_log"
 semgrep_rc=0
-semgrep scan \
+run_with_timeout "${SEMGREP_SCAN_TIMEOUT:-15m}" semgrep scan \
     --config p/rust \
     --config p/python \
     --config p/javascript \
@@ -51,14 +65,14 @@ semgrep scan \
     --exclude 'crates/agent/src/tools/evals/fixtures' \
     . > "$semgrep_log" 2>&1 || semgrep_rc=$?
 
-printf 'security-scan: running OSV-Scanner; report: %s\n' "$osv_report"
+printf 'security-scan: running OSV-Scanner; reports: %s and %s\n' "$osv_report" "$osv_log"
 osv_rc=0
-osv-scanner scan source \
+run_with_timeout "${OSV_SCAN_TIMEOUT:-5m}" osv-scanner scan source \
     --recursive \
     --verbosity=error \
     --format=json \
     --output-file "$osv_report" \
-    . || osv_rc=$?
+    . > "$osv_log" 2>&1 || osv_rc=$?
 
 if (( semgrep_rc > 1 )); then
     printf 'security-scan: Semgrep failed to execute correctly (exit %d)\n' "$semgrep_rc" >&2
@@ -67,6 +81,7 @@ if (( semgrep_rc > 1 )); then
 fi
 if (( osv_rc > 1 )); then
     printf 'security-scan: OSV-Scanner failed to execute correctly (exit %d)\n' "$osv_rc" >&2
+    tail -n 40 "$osv_log" >&2
     exit "$osv_rc"
 fi
 
