@@ -29,13 +29,15 @@ git -C "$test_repo" config user.name "Hook Test"
 git -C "$test_repo" config user.email "hook-test@example.com"
 printf 'print("ok")\n' > "$test_repo/check.py"
 printf '#!/usr/bin/env bash\ntrue\n' > "$test_repo/check.sh"
+printf '#!/usr/bin/env ksh\ntrue\n' > "$test_repo/check.ksh"
 printf 'unchanged\n' > "$test_repo/notes.txt"
 git -C "$test_repo" add .
 git -C "$test_repo" commit -qm "baseline"
 
 printf 'print("changed")\n' > "$test_repo/check.py"
 printf '#!/usr/bin/env bash\nprintf "changed\\n"\n' > "$test_repo/check.sh"
-git -C "$test_repo" add check.py check.sh
+printf '#!/usr/bin/env ksh\nprintf "changed\\n"\n' > "$test_repo/check.ksh"
+git -C "$test_repo" add check.py check.sh check.ksh
 
 (
     cd "$test_repo"
@@ -45,13 +47,17 @@ git -C "$test_repo" add check.py check.sh
 
 grep -F "gitleaks git --pre-commit --redact --staged --verbose" "$hook_log"
 grep -F "ruff check --select F,E7 --output-format=concise -- check.py" "$hook_log"
-grep -F "shellcheck -x -S error -- check.sh" "$hook_log"
+grep -F "shellcheck -x -S error --" "$hook_log"
+grep -F "check.sh" "$hook_log"
+grep -F "check.ksh" "$hook_log"
 
 : > "$hook_log"
 (
     cd "$test_repo"
-    PATH="$fake_bin:$PATH" HOOK_TEST_LOG="$hook_log" \
-        bash .hooks/pre-push origin https://github.com/example/repo
+    printf '%s\n' \
+        'refs/heads/topic 1111111111111111111111111111111111111111 refs/heads/topic 0000000000000000000000000000000000000000' \
+        | env PATH="$fake_bin:$PATH" HOOK_TEST_LOG="$hook_log" \
+            bash .hooks/pre-push origin https://github.com/example/repo
 )
 
 grep -F "semgrep scan --config p/rust --config p/python --config p/javascript" "$hook_log"

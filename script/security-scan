@@ -56,8 +56,6 @@ osv_rc=0
 osv-scanner scan source \
     --recursive \
     --verbosity=error \
-    --experimental-exclude target \
-    --experimental-exclude graphify-out \
     --format=json \
     --output-file "$osv_report" \
     . || osv_rc=$?
