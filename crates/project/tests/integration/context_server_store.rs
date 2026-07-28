@@ -1041,11 +1041,8 @@ async fn test_http_server_authenticates_on_notification_401(cx: &mut TestAppCont
     });
 }
 
-// A transport failure that is not an authentication challenge must not touch
-// the server's state: no spurious auth flow, and (as before the transport
-// watch existed) the server stays `Running`.
 #[gpui::test]
-async fn test_http_server_ignores_non_auth_transport_failure(cx: &mut TestAppContext) {
+async fn test_http_server_reports_non_auth_transport_failure(cx: &mut TestAppContext) {
     const SERVER_ID: &str = "flaky-server";
     let server_id = ContextServerId(SERVER_ID.into());
 
@@ -1070,6 +1067,10 @@ async fn test_http_server_ignores_non_auth_transport_failure(cx: &mut TestAppCon
             vec![
                 (server_id.clone(), ContextServerStatus::Starting),
                 (server_id.clone(), ContextServerStatus::Running),
+                (
+                    server_id.clone(),
+                    ContextServerStatus::Error("connection reset".into()),
+                ),
             ],
             cx,
         );
@@ -1095,8 +1096,8 @@ async fn test_http_server_ignores_non_auth_transport_failure(cx: &mut TestAppCon
     cx.update(|cx| {
         assert_eq!(
             store.read(cx).status_for_server(&server_id),
-            Some(ContextServerStatus::Running),
-            "a non-auth transport failure should not change the server state"
+            Some(ContextServerStatus::Error("connection reset".into())),
+            "a non-auth transport failure should be visible in the server state"
         );
     });
 }
@@ -1227,8 +1228,8 @@ async fn test_http_server_restart_clears_stale_auth_challenge(cx: &mut TestAppCo
     cx.update(|cx| {
         assert_eq!(
             store.read(cx).status_for_server(&server_id),
-            Some(ContextServerStatus::Running),
-            "a stale challenge from a previous client generation must not trigger auth"
+            Some(ContextServerStatus::Error("connection reset".into())),
+            "a stale challenge from a previous client generation must not turn a transport error into an authentication challenge"
         );
     });
 }

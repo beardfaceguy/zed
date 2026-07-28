@@ -3617,6 +3617,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::time::Duration;
     use workspace::{Item, MultiWorkspace};
 
     use crate::agent_panel;
@@ -4216,8 +4217,8 @@ pub(crate) mod tests {
         });
         assert_eq!(
             close_session_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "ConversationView should close the ACP session after a thread exit"
+            0,
+            "ConversationView must not issue close_session against a retired ACP connection"
         );
     }
 
@@ -4657,6 +4658,7 @@ pub(crate) mod tests {
                 .agent_server_store()
                 .update(cx, |_store, cx| cx.emit(project::AgentServersUpdated));
         });
+        cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
 
         // The retry should have resumed the ORIGINAL session, not created a

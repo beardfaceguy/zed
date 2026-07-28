@@ -1,4 +1,4 @@
-use crate::{AcpThread, ElicitationStore};
+use crate::{AcpThread, ElicitationStore, LoadError};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -98,6 +98,10 @@ pub trait AgentConnection {
     fn telemetry_id(&self) -> SharedString;
 
     fn agent_version(&self) -> Option<SharedString> {
+        None
+    }
+
+    fn retirement(&self) -> Option<watch::Receiver<Option<LoadError>>> {
         None
     }
 
