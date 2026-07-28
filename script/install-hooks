@@ -14,6 +14,9 @@ missing_tools=()
 for tool in gitleaks ruff shellcheck semgrep osv-scanner; do
     command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
+if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+    missing_tools+=("timeout/gtimeout")
+fi
 if (( ${#missing_tools[@]} > 0 )); then
     printf 'install-hooks: missing required tool(s): %s\n' "${missing_tools[*]}" >&2
     printf '%s\n' \
@@ -21,7 +24,8 @@ if (( ${#missing_tools[@]} > 0 )); then
         '  shellcheck:  apt install shellcheck or brew install shellcheck' \
         '  gitleaks:    https://github.com/gitleaks/gitleaks#installing' \
         '  semgrep:     pipx install semgrep, uv tool install semgrep, or brew install semgrep' \
-        '  osv-scanner: https://google.github.io/osv-scanner/installation/' >&2
+        '  osv-scanner: https://google.github.io/osv-scanner/installation/' \
+        '  timeout:     coreutils package (`timeout` on Linux, `gtimeout` on macOS)' >&2
     exit 1
 fi
 

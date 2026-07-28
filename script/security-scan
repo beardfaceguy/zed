@@ -25,17 +25,19 @@ require_tool() {
 require_tool semgrep
 require_tool osv-scanner
 
+if command -v timeout >/dev/null 2>&1; then
+    timeout_command=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_command=gtimeout
+else
+    printf 'security-scan: required tool `timeout` or `gtimeout` is not installed\n' >&2
+    exit 2
+fi
+
 run_with_timeout() {
     local duration="$1"
     shift
-    if command -v timeout >/dev/null 2>&1; then
-        timeout --foreground "$duration" "$@"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout --foreground "$duration" "$@"
-    else
-        printf 'security-scan: warning: timeout/gtimeout unavailable; running without a whole-scan timeout\n' >&2
-        "$@"
-    fi
+    "$timeout_command" --foreground "$duration" "$@"
 }
 
 git_dir="$(git rev-parse --git-dir)"

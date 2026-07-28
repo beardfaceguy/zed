@@ -29,6 +29,9 @@ The pre-push hook runs the broader, network-dependent checks:
 - OSV-Scanner checks dependency lockfiles against the OSV vulnerability
   database.
 
+The installer also requires GNU `timeout` (`gtimeout` from coreutils on macOS)
+so Semgrep and OSV cannot hang a push indefinitely.
+
 Reports are written under `.git/security-reports`. The repository currently
 has pre-existing Semgrep and OSV findings, so pushes run in advisory mode:
 findings are reported but do not block. Scanner execution failures still
