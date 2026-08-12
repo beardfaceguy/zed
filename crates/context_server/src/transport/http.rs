@@ -413,7 +413,7 @@ async fn pump_sse_body(
                         data_buffer.clear();
                     }
                     in_message = false;
-                } else if let Some(data) = line.strip_prefix("data: ") {
+                } else if let Some(data) = line.strip_prefix("data:") {
                     let data = data.trim();
                     if !data.is_empty() {
                         if data == "ping" {
@@ -423,7 +423,7 @@ async fn pump_sse_body(
                         data_buffer.push(data.to_string());
                         in_message = true;
                     }
-                } else if let Some(id) = line.strip_prefix("id: ") {
+                } else if let Some(id) = line.strip_prefix("id:") {
                     // Per MCP streamable-HTTP §4.5, the client MUST echo the
                     // most-recently-seen `id` back in `Last-Event-ID` on
                     // resume. We hold this in the SSE-pump's local state and
@@ -587,9 +587,13 @@ impl Drop for HttpTransport {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use futures::FutureExt as _;
     use gpui::TestAppContext;
     use parking_lot::Mutex as SyncMutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     /// A mock token provider that returns a configurable token and tracks
     /// refresh attempts.
@@ -665,6 +669,52 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(AsyncBody::from(body.as_bytes().to_vec()))
             .unwrap())
+    }
+
+    #[gpui::test]
+    async fn test_sse_data_field(cx: &mut TestAppContext) {
+        for data_prefix in ["data:", "data: "] {
+            let body = format!(
+                "id:1\nevent:message\n{data_prefix}{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}\n\n"
+            );
+            let client = make_fake_http_client(move |_req| {
+                let body = body.clone();
+                Box::pin(async move {
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("Content-Type", "text/event-stream;charset=UTF-8")
+                        .body(AsyncBody::from(body.into_bytes()))
+                        .unwrap())
+                })
+            });
+
+            let transport = HttpTransport::new(
+                client,
+                "http://mcp.example.com/mcp".to_string(),
+                HashMap::default(),
+                cx.background_executor.clone(),
+            );
+
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_string())
+                .await
+                .expect("send should succeed");
+
+            let mut responses = transport.receive();
+            let next_response = responses.next().fuse();
+            let timeout = cx.background_executor.timer(Duration::from_secs(1)).fuse();
+            futures::pin_mut!(next_response, timeout);
+
+            let response = futures::select_biased! {
+                response = next_response => response.expect("expected SSE response"),
+                _ = timeout => panic!("timed out waiting for SSE response with {data_prefix:?}"),
+            };
+
+            assert_eq!(
+                response, r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                "unexpected SSE response for {data_prefix:?}",
+            );
+        }
     }
 
     #[gpui::test]

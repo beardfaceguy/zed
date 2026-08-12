@@ -190,7 +190,7 @@ impl Client {
         log::debug!(
             "starting context server (executable={:?}, args={:?})",
             binary.executable,
-            &binary.args
+            binary.args
         );
 
         let server_name = binary
@@ -312,7 +312,7 @@ impl Client {
         let mut receiver = transport.receive();
 
         while let Some(message) = receiver.next().await {
-            log::trace!("recv: {}", &message);
+            log::trace!("recv: {message}");
             // Mark the connection as alive on every inbound frame, regardless
             // of whether it parses or routes anywhere. The MCP spec lets
             // servers emit `notifications/progress` (or any other notification)
