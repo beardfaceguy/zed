@@ -56,6 +56,13 @@ Merged into `main` together, which also advanced upstream from 2026-07-15 to
 PR #9 also carried a squashed copy of PR #8. The content was identical so the
 merge was conflict-free, but the hook scripts appear twice in history.
 
+### Spawn and startup correctness
+
+| Change | Why |
+| --- | --- |
+| Fall back to process sessions when cgroups are unavailable | Zed is not always started inside a cgroup it can delegate from. With a root-owned login session scope, neither creating a child cgroup nor attaching a transient systemd scope is permitted, so every process tree spawn failed with permission denied and no agent could start. Process sessions still confine descendants, so it degrades to them with a warning. This also unblocked two tests that could not spawn a child process at all. |
+| Wait for context server reconciliation before `session/new` | Session creation could race ahead of `ContextServerStore` reconciliation and hand the agent an empty `mcpServers` list, with nothing to indicate anything was missing. |
+
 ### Agent capability support
 
 | Change | Why |
@@ -76,25 +83,7 @@ merge was conflict-free, but the hook scripts appear twice in history.
 
 | Branch | Contents |
 | --- | --- |
-| `fix/cgroup-fallback` | Two fixes, currently uncommitted. Spawning a process tree fails with permission denied when the login session scope is root-owned, because neither creating a child cgroup nor attaching a transient systemd scope is permitted; this degrades to Unix process-group sessions with a warning instead of failing the agent spawn. Separately, `session/new` could race ahead of `ContextServerStore` reconciliation and hand the agent an empty `mcpServers` list, so session creation now waits on a readiness signal. |
 | `feat/agent-explain-popover` | Select text in an agent chat, right-click **Explain**, and get a draggable popover answered by an isolated agent session that does not pollute the main thread. Tracked in Vikunja project 199. Spun out as a standalone desktop tool at [beardfaceguy/mimir](https://github.com/beardfaceguy/mimir). |
-
-### The cgroup fallback blocks tests, not just agents
-
-On a host whose login session scope is root-owned, two tests fail before they do
-any real work, because neither can spawn a child process at all:
-
-- `context_server`: `server_that_exits_on_its_own_is_reaped`
-- `agent_servers`: `startup_returns_error_when_agent_exits_before_initialization`
-
-Both fail with `failed to create cgroup ...: Permission denied` and
-`current cgroup is not within app.slice`. Applying the `fix/cgroup-fallback`
-change to `crates/util/src/process.rs` turns both green. Treat a failure in
-either as an environment problem until that branch lands.
-
-Rebasing that branch onto current `main` is mostly clean — `process.rs`,
-`acp.rs` and the install scripts all apply as-is. Only
-`crates/project/src/context_server_store.rs` conflicts, because PR #7 rewrote it.
 
 ## Upstreaming
 
