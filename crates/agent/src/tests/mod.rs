@@ -572,9 +572,7 @@ async fn test_system_prompt(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_system_prompt_includes_labeled_context_server_instructions(
-    cx: &mut TestAppContext,
-) {
+async fn test_system_prompt_includes_labeled_context_server_instructions(cx: &mut TestAppContext) {
     let ThreadTest {
         model,
         thread,

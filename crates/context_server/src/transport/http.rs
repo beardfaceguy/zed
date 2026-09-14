@@ -986,9 +986,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn sse_stream_error_triggers_get_reconnect_with_last_event_id(
-        cx: &mut TestAppContext,
-    ) {
+    async fn sse_stream_error_triggers_get_reconnect_with_last_event_id(cx: &mut TestAppContext) {
         let request_log: Arc<SyncMutex<Vec<(http_client::http::Method, Option<String>)>>> =
             Arc::new(SyncMutex::new(Vec::new()));
         let log = request_log.clone();
@@ -1014,7 +1012,8 @@ mod tests {
                         .unwrap())
                 } else {
                     // Resumption GET: deliver the actual final response.
-                    let body = b"id: 2\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n".to_vec();
+                    let body =
+                        b"id: 2\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n".to_vec();
                     Ok(Response::builder()
                         .status(200)
                         .header("Content-Type", "text/event-stream")
@@ -1072,7 +1071,8 @@ mod tests {
         let client = make_fake_http_client(move |req| {
             log.lock().push(req.method().clone());
             Box::pin(async {
-                let body = b"id: 1\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n".to_vec();
+                let body =
+                    b"id: 1\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n".to_vec();
                 Ok(Response::builder()
                     .status(200)
                     .header("Content-Type", "text/event-stream")

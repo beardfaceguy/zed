@@ -10263,11 +10263,7 @@ mod tests {
         });
     }
 
-    fn insert_in_progress_tool_call(
-        thread: &Entity<AcpThread>,
-        cx: &mut TestAppContext,
-        id: &str,
-    ) {
+    fn insert_in_progress_tool_call(thread: &Entity<AcpThread>, cx: &mut TestAppContext, id: &str) {
         thread.update(cx, |thread, cx| {
             thread
                 .upsert_tool_call(
@@ -10293,9 +10289,11 @@ mod tests {
         let cancel_calls = connection.cancel_calls.clone();
         let thread = cx
             .update(|cx| {
-                connection
-                    .clone()
-                    .new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
             })
             .await
             .unwrap();
@@ -10349,9 +10347,11 @@ mod tests {
         let cancel_calls = connection.cancel_calls.clone();
         let thread = cx
             .update(|cx| {
-                connection
-                    .clone()
-                    .new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
             })
             .await
             .unwrap();
@@ -10364,8 +10364,7 @@ mod tests {
                 .update_tool_call(
                     acp::ToolCallUpdate::new(
                         acp::ToolCallId::new("search-2"),
-                        acp::ToolCallUpdateFields::new()
-                            .status(acp::ToolCallStatus::Completed),
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
                     ),
                     cx,
                 )
@@ -10392,9 +10391,11 @@ mod tests {
         let cancel_calls = connection.cancel_calls.clone();
         let thread = cx
             .update(|cx| {
-                connection
-                    .clone()
-                    .new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
             })
             .await
             .unwrap();
@@ -10422,9 +10423,11 @@ mod tests {
         let cancel_calls = connection.cancel_calls.clone();
         let thread = cx
             .update(|cx| {
-                connection
-                    .clone()
-                    .new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
             })
             .await
             .unwrap();
@@ -10438,8 +10441,7 @@ mod tests {
                 .update_tool_call(
                     acp::ToolCallUpdate::new(
                         acp::ToolCallId::new("search-4"),
-                        acp::ToolCallUpdateFields::new()
-                            .status(acp::ToolCallStatus::Failed),
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
                     ),
                     cx,
                 )
