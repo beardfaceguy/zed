@@ -1181,6 +1181,7 @@ impl AcpConnection {
             ConnectionTo<Agent>,
             acp::SessionId,
             SessionDirectories,
+            Vec<acp::McpServer>,
         )
             -> futures::future::LocalBoxFuture<'static, Result<SessionConfigResponse>>
         + 'static,
@@ -1211,12 +1212,18 @@ impl AcpConnection {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
+        let context_server_store = project.read(cx).context_server_store();
+        let pending_server_updates = context_server_store
+            .read(cx)
+            .wait_for_pending_server_updates();
 
         let shared_task = cx
             .spawn({
                 let session_id = session_id.clone();
                 let this = self.clone();
                 async move |cx| {
+                    pending_server_updates.await;
+                    let mcp_servers = cx.update(|cx| mcp_servers_for_project(&project, cx));
                     let action_log = cx.new(|_| ActionLog::new(project.clone()));
                     let thread: Entity<AcpThread> = cx.new(|cx| {
                         AcpThread::new(
@@ -1249,17 +1256,21 @@ impl AcpConnection {
                         },
                     );
 
-                    let response =
-                        match rpc_call(this.connection.clone(), session_id.clone(), directories)
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(err) => {
-                                this.sessions.borrow_mut().remove(&session_id);
-                                this.pending_sessions.borrow_mut().remove(&session_id);
-                                return Err(Arc::new(err));
-                            }
-                        };
+                    let response = match rpc_call(
+                        this.connection.clone(),
+                        session_id.clone(),
+                        directories,
+                        mcp_servers,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => {
+                            this.sessions.borrow_mut().remove(&session_id);
+                            this.pending_sessions.borrow_mut().remove(&session_id);
+                            return Err(Arc::new(err));
+                        }
+                    };
 
                     let (modes, config_options) =
                         config_state(response.modes, response.config_options);
@@ -1803,9 +1814,14 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let context_server_store = project.read(cx).context_server_store();
+        let pending_server_updates = context_server_store
+            .read(cx)
+            .wait_for_pending_server_updates();
 
         cx.spawn(async move |cx| {
+            pending_server_updates.await;
+            let mcp_servers = cx.update(|cx| mcp_servers_for_project(&project, cx));
             let response = self
                 .connection
                 .send_request(directories.into_new_session_request(mcp_servers))
@@ -1934,13 +1950,12 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
         self.open_or_create_session(
             session_id,
             project,
             work_dirs,
             title,
-            move |connection, session_id, directories| {
+            move |connection, session_id, directories, mcp_servers| {
                 Box::pin(async move {
                     let response = connection
                         .send_request(
@@ -1978,13 +1993,12 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
         self.open_or_create_session(
             session_id,
             project,
             work_dirs,
             title,
-            move |connection, session_id, directories| {
+            move |connection, session_id, directories, mcp_servers| {
                 Box::pin(async move {
                     let response = connection
                         .send_request(
@@ -2415,6 +2429,7 @@ pub mod test_support {
 
     pub struct FakeAcpConnectionHarness {
         pub connection: Rc<AcpConnection>,
+        pub new_session_requests: Arc<Mutex<Vec<acp::NewSessionRequest>>>,
         pub load_session_count: Arc<AtomicUsize>,
         pub close_session_count: Arc<AtomicUsize>,
         pub logout_count: Arc<AtomicUsize>,
@@ -2614,6 +2629,7 @@ pub mod test_support {
         let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
 
         let logout_count = Arc::new(AtomicUsize::new(0));
+        let new_session_requests = Arc::new(Mutex::new(Vec::new()));
         let sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>> =
             Rc::new(RefCell::new(HashMap::default()));
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
@@ -2677,8 +2693,16 @@ pub mod test_support {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |_req: acp::NewSessionRequest, responder, _cx| {
-                    responder.respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                {
+                    let new_session_requests = new_session_requests.clone();
+                    async move |request: acp::NewSessionRequest, responder, _cx| {
+                        new_session_requests
+                            .lock()
+                            .expect("new session requests lock should not be poisoned")
+                            .push(request);
+                        responder
+                            .respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2799,6 +2823,7 @@ pub mod test_support {
 
         Ok(FakeAcpConnectionHarness {
             connection: Rc::new(connection),
+            new_session_requests,
             load_session_count,
             close_session_count,
             logout_count,
@@ -3511,6 +3536,89 @@ mod tests {
                 additional_directories: Vec::new(),
             }
         );
+    }
+
+    #[gpui::test]
+    async fn new_session_waits_for_pending_context_server_update(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            std::path::Path::new("/workspace"),
+            serde_json::json!({ "main.rs": "" }),
+        )
+        .await;
+        let project = project::Project::test(fs, [std::path::Path::new("/workspace")], cx).await;
+        let harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+
+        cx.update(|cx| {
+            let mut settings = project::project_settings::ProjectSettings::get_global(cx).clone();
+            settings.context_servers.insert(
+                "test-mcp".into(),
+                project::project_settings::ContextServerSettings::Stdio {
+                    enabled: true,
+                    remote: false,
+                    command: settings::ContextServerCommand {
+                        path: "test-mcp-command".into(),
+                        args: Vec::new(),
+                        env: None,
+                        timeout: None,
+                    },
+                },
+            );
+            project::project_settings::ProjectSettings::override_global(settings, cx);
+        });
+
+        let context_server_store =
+            project.read_with(cx, |project, _| project.context_server_store());
+        let configured_server_ids =
+            context_server_store.read_with(cx, |store, _| store.configured_server_ids());
+        let [server_id] = configured_server_ids.as_slice() else {
+            panic!("expected one configured context server, got {configured_server_ids:?}");
+        };
+        assert_eq!(server_id.0.as_ref(), "test-mcp");
+        let server_id = server_id.clone();
+        assert!(
+            context_server_store.read_with(cx, |store, _| {
+                store.configuration_for_server(&server_id).is_none()
+            }),
+            "test setup should leave the context server update pending"
+        );
+        let new_session = cx.update(|cx| {
+            harness.connection.clone().new_session(
+                project.clone(),
+                PathList::new(&[std::path::Path::new("/workspace")]),
+                cx,
+            )
+        });
+
+        new_session.await.expect("new session should succeed");
+        assert!(
+            context_server_store.read_with(cx, |store, _| {
+                store.configuration_for_server(&server_id).is_some()
+            }),
+            "context server configuration should be resolved before the session is created"
+        );
+
+        let requests = harness
+            .new_session_requests
+            .lock()
+            .expect("new session requests lock should not be poisoned");
+        let [request] = requests.as_slice() else {
+            panic!("expected one new session request, got {requests:?}");
+        };
+        let [acp::McpServer::Stdio(server)] = request.mcp_servers.as_slice() else {
+            panic!(
+                "expected one stdio MCP server, got {:?}",
+                request.mcp_servers
+            );
+        };
+        assert_eq!(server.name, "test-mcp");
+        assert_eq!(server.command, PathBuf::from("test-mcp-command"));
+        assert!(server.args.is_empty());
     }
 
     #[test]
@@ -4895,6 +5003,10 @@ mod tests {
     }
 }
 
+// ACP cannot add MCP servers after session creation, so callers wait for pending
+// configuration updates before collecting this list. That may delay session creation
+// on extension command resolution or remote and keychain access, but avoids creating
+// a session that is permanently missing configured servers.
 fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
