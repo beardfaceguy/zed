@@ -171,18 +171,25 @@ mod unix_process_tree {
     pub(super) enum ProcessTree {
         #[cfg(target_os = "linux")]
         Cgroup(super::linux_cgroup::Cgroup),
-        #[cfg(not(target_os = "linux"))]
         Session(super::unix_process_group::ProcessGroup),
     }
 
     impl ProcessTree {
         pub(super) fn spawn() -> Result<Self> {
             #[cfg(target_os = "linux")]
-            {
-                return Ok(Self::Cgroup(super::linux_cgroup::Cgroup::spawn()?));
+            match super::linux_cgroup::Cgroup::spawn() {
+                Ok(cgroup) => return Ok(Self::Cgroup(cgroup)),
+                // Zed is not always started inside a cgroup it may delegate
+                // from. A login session scope is owned by root, so neither
+                // creating a child cgroup nor attaching a transient scope to
+                // it is permitted. Process sessions still confine descendants,
+                // so degrade to them rather than failing every spawn.
+                Err(error) => log::warn!(
+                    "cgroup process tree unavailable, \
+                     falling back to process session: {error:#}"
+                ),
             }
 
-            #[cfg(not(target_os = "linux"))]
             Ok(Self::Session(
                 super::unix_process_group::ProcessGroup::spawn()?,
             ))
@@ -192,7 +199,6 @@ mod unix_process_tree {
             match self {
                 #[cfg(target_os = "linux")]
                 Self::Cgroup(cgroup) => cgroup.configure_command(command),
-                #[cfg(not(target_os = "linux"))]
                 Self::Session(process_group) => process_group.configure_command(command),
             }
         }
@@ -201,7 +207,6 @@ mod unix_process_tree {
             match self {
                 #[cfg(target_os = "linux")]
                 Self::Cgroup(cgroup) => cgroup.kill(),
-                #[cfg(not(target_os = "linux"))]
                 Self::Session(process_group) => process_group.kill(),
             }
         }
@@ -210,6 +215,7 @@ mod unix_process_tree {
         pub(super) fn cgroup_path(&self) -> Option<&std::path::Path> {
             match self {
                 Self::Cgroup(cgroup) => Some(cgroup.path()),
+                Self::Session(_) => None,
             }
         }
     }
@@ -602,7 +608,6 @@ done
 }
 
 #[cfg(unix)]
-#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 mod unix_process_group {
     use anyhow::{Context as _, Result};
     use std::{
