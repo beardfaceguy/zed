@@ -13,12 +13,13 @@ use context_server::transport::HttpTransport;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
 use credentials_provider::CredentialsProvider;
 use futures::future::Either;
-use futures::{FutureExt as _, StreamExt as _, future::join_all};
+use futures::{Future, FutureExt as _, StreamExt as _, future::join_all};
 use gpui::{
     App, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, TaskExt, WeakEntity, actions,
 };
 use http_client::HttpClient;
 use itertools::Itertools;
+use postage::{prelude::Stream as _, watch};
 use rand::Rng as _;
 use registry::ContextServerDescriptorRegistry;
 use remote::{Interactive, RemoteClient};
@@ -300,6 +301,7 @@ pub struct ContextServerStore {
     project: Option<WeakEntity<Project>>,
     registry: Entity<ContextServerDescriptorRegistry>,
     update_servers_task: Option<Task<Result<()>>>,
+    server_updates_complete: (watch::Sender<bool>, watch::Receiver<bool>),
     context_server_factory: Option<ContextServerFactory>,
     restart_backoffs: HashMap<ContextServerId, ContextServerRestartBackoff>,
     needs_server_update: bool,
@@ -386,6 +388,17 @@ impl ContextServerStore {
             .filter(|(_, entry)| entry.settings.enabled())
             .map(|(id, _)| ContextServerId(id.clone()))
             .collect()
+    }
+
+    pub fn wait_for_pending_server_updates(&self) -> impl Future<Output = ()> + use<> {
+        let mut receiver = self.server_updates_complete.1.clone();
+        async move {
+            while !*receiver.borrow() {
+                if receiver.recv().await.is_none() {
+                    break;
+                }
+            }
+        }
     }
 
     #[cfg(feature = "test-support")]
@@ -522,6 +535,7 @@ impl ContextServerStore {
             servers: HashMap::default(),
             server_ids: Default::default(),
             update_servers_task: None,
+            server_updates_complete: watch::channel_with(true),
             context_server_factory,
             restart_backoffs: HashMap::default(),
         };
@@ -1824,6 +1838,7 @@ impl ContextServerStore {
             self.needs_server_update = true;
         } else {
             self.needs_server_update = false;
+            *self.server_updates_complete.0.borrow_mut() = false;
             self.update_servers_task = Some(cx.spawn(async move |this, cx| {
                 if let Err(err) = Self::maintain_servers(this.clone(), cx).await {
                     log::error!("Error maintaining context servers: {}", err);
@@ -1835,6 +1850,8 @@ impl ContextServerStore {
                     this.update_servers_task.take();
                     if this.needs_server_update {
                         this.available_context_servers_changed(cx);
+                    } else {
+                        *this.server_updates_complete.0.borrow_mut() = true;
                     }
                 })?;
 
