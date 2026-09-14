@@ -23,8 +23,8 @@ pub use acp::test_support::{
     FakeAcpAgentServer, FakeAcpConnectionHarness, connect_fake_acp_connection,
 };
 pub use acp::{
-    AcpConnection, AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection,
-    GEMINI_TERMINAL_AUTH_METHOD_ID,
+    AcpConnection, AcpConnectionRetired, AcpDebugMessage, AcpDebugMessageContent,
+    AcpDebugMessageDirection, GEMINI_TERMINAL_AUTH_METHOD_ID,
 };
 
 pub struct AgentServerDelegate {

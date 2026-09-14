@@ -3,10 +3,11 @@ pub mod registry;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet};
+use context_server::client::TransportShutdown;
 use context_server::oauth::{self, McpOAuthTokenProvider, OAuthDiscovery, OAuthSession};
 use context_server::transport::HttpTransport;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
@@ -35,6 +36,9 @@ use crate::{
 /// Maximum timeout for context server requests
 /// Prevents extremely large timeout values from tying up resources indefinitely.
 const MAX_TIMEOUT_SECS: u64 = 600; // 10 minutes
+const STABLE_CONTEXT_SERVER_DURATION: Duration = Duration::from_secs(30);
+const INITIAL_CONTEXT_SERVER_RESTART_DELAY: Duration = Duration::from_secs(1);
+const MAX_CONTEXT_SERVER_RESTART_DELAY: Duration = Duration::from_secs(30);
 
 pub fn init(cx: &mut App) {
     extension::init(cx);
@@ -94,6 +98,7 @@ enum ContextServerState {
     Running {
         server: Arc<ContextServer>,
         configuration: Arc<ContextServerConfiguration>,
+        started_at: Instant,
         /// Initiates the OAuth flow if the transport shuts down on an
         /// authentication challenge; cancelled by any state transition.
         _transport_watch: Task<()>,
@@ -298,9 +303,16 @@ pub struct ContextServerStore {
     update_servers_task: Option<Task<Result<()>>>,
     server_updates_complete: (watch::Sender<bool>, watch::Receiver<bool>),
     context_server_factory: Option<ContextServerFactory>,
+    restart_backoffs: HashMap<ContextServerId, ContextServerRestartBackoff>,
     needs_server_update: bool,
     ai_disabled: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Default)]
+struct ContextServerRestartBackoff {
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
 }
 
 pub struct ServerStatusChangedEvent {
@@ -525,6 +537,7 @@ impl ContextServerStore {
             update_servers_task: None,
             server_updates_complete: watch::channel_with(true),
             context_server_factory,
+            restart_backoffs: HashMap::default(),
         };
         if maintain_server_loop && !DisableAiSettings::get_global(cx).disable_ai {
             this.available_context_servers_changed(cx);
@@ -576,6 +589,21 @@ impl ContextServerStore {
             Some(ContextServerSettings::Extension { .. }) => true,
             // No custom settings entry: the server can only originate from an
             // extension descriptor in the registry.
+            None => self
+                .registry
+                .read(cx)
+                .context_server_descriptor(&id.0)
+                .is_some(),
+        }
+    }
+
+    /// Returns whether a server is enabled.
+    /// Servers with no settings entry only originate from an extension
+    /// descriptor in the registry, and those are enabled by default
+    /// ([`ContextServerSettings::default_extension`]).
+    pub fn is_server_enabled(&self, id: &ContextServerId, cx: &App) -> bool {
+        match self.settings_for_server(id) {
+            Some(settings) => settings.enabled(),
             None => self
                 .registry
                 .read(cx)
@@ -691,6 +719,7 @@ impl ContextServerStore {
         let configuration = state.configuration();
         let result = server.stop();
         drop(state);
+        self.restart_backoffs.remove(id);
 
         self.update_server_state(
             id.clone(),
@@ -702,6 +731,30 @@ impl ContextServerStore {
         );
 
         result
+    }
+
+    pub fn restart_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) -> Result<()> {
+        let state = self.servers.get(id).context("Context server not found")?;
+        match state {
+            ContextServerState::Starting { .. } | ContextServerState::Running { .. } => {
+                return Ok(());
+            }
+            ContextServerState::AuthRequired { .. }
+            | ContextServerState::ClientSecretRequired { .. }
+            | ContextServerState::Authenticating { .. } => {
+                anyhow::bail!("Context server requires authentication");
+            }
+            ContextServerState::Stopped { .. } | ContextServerState::Error { .. } => {}
+        }
+
+        let configuration = state.configuration();
+        let server = self
+            .context_server_factory
+            .as_ref()
+            .map(|factory| factory(id.clone(), configuration.clone()))
+            .unwrap_or_else(|| state.server());
+        self.run_server(server, configuration, cx);
+        Ok(())
     }
 
     fn run_server(
@@ -721,12 +774,21 @@ impl ContextServerStore {
         ) {
             self.stop_server(&id, cx).log_err();
         }
+        let restart_delay = self.restart_delay(&id, cx);
+        if !restart_delay.is_zero() {
+            log::warn!(
+                "Delaying restart of context server `{id}` by {restart_delay:?} after repeated failures"
+            );
+        }
         let task = cx.spawn({
             let id = server.id();
             let server = server.clone();
             let configuration = configuration.clone();
 
             async move |this, cx| {
+                if !restart_delay.is_zero() {
+                    cx.background_executor().timer(restart_delay).await;
+                }
                 let new_state = match server.clone().start(cx).await {
                     Ok(_) => {
                         debug_assert!(server.client().is_some());
@@ -735,12 +797,16 @@ impl ContextServerStore {
                         ContextServerState::Running {
                             server,
                             configuration,
+                            started_at: cx.background_executor().now(),
                             _transport_watch,
                         }
                     }
                     Err(err) => resolve_start_failure(&id, err, server, configuration, cx).await,
                 };
                 this.update(cx, |this, cx| {
+                    if let ContextServerState::Error { error, .. } = &new_state {
+                        this.record_connection_failure(&id, error, cx);
+                    }
                     this.update_server_state(id.clone(), new_state, cx)
                 })
                 .log_err();
@@ -780,16 +846,98 @@ impl ContextServerStore {
             return Task::ready(());
         };
         cx.spawn(async move |cx| {
-            let Some(www_authenticate) = shutdown.await else {
-                // Non-auth transport deaths leave the server state untouched,
-                // as they did before this watch existed.
-                return;
-            };
-            this.update(cx, |this, cx| {
-                this.handle_auth_challenge(server, www_authenticate, cx);
+            let shutdown = shutdown.await;
+            this.update(cx, |this, cx| match shutdown {
+                TransportShutdown::AuthenticationRequired(www_authenticate) => {
+                    this.handle_auth_challenge(server, www_authenticate, cx);
+                }
+                TransportShutdown::Disconnected(error) => {
+                    this.handle_transport_shutdown(server, error, cx);
+                }
             })
             .log_err();
         })
+    }
+
+    fn handle_transport_shutdown(
+        &mut self,
+        server: Arc<ContextServer>,
+        error: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = server.id();
+        let Some(ContextServerState::Running {
+            server: running_server,
+            configuration,
+            started_at,
+            ..
+        }) = self.servers.get(&id)
+        else {
+            return;
+        };
+        if !Arc::ptr_eq(running_server, &server) {
+            return;
+        }
+        let configuration = configuration.clone();
+        let started_at = *started_at;
+
+        log::warn!("Context server `{id}` disconnected: {error}");
+        server.stop().log_err();
+        self.record_transport_shutdown(&id, started_at, &error, cx);
+        self.update_server_state(
+            id,
+            ContextServerState::Error {
+                server,
+                configuration,
+                error,
+            },
+            cx,
+        );
+    }
+
+    fn restart_delay(&mut self, id: &ContextServerId, cx: &App) -> Duration {
+        let Some(backoff) = self.restart_backoffs.get_mut(id) else {
+            return Duration::ZERO;
+        };
+        let Some(retry_at) = backoff.retry_at else {
+            return Duration::ZERO;
+        };
+        let now = cx.background_executor().now();
+        if now >= retry_at {
+            backoff.retry_at = None;
+            Duration::ZERO
+        } else {
+            retry_at - now
+        }
+    }
+
+    fn record_transport_shutdown(
+        &mut self,
+        id: &ContextServerId,
+        started_at: Instant,
+        error: &Arc<str>,
+        cx: &App,
+    ) {
+        let now = cx.background_executor().now();
+        if now.saturating_duration_since(started_at) >= STABLE_CONTEXT_SERVER_DURATION {
+            self.restart_backoffs.remove(id);
+            return;
+        }
+        self.record_connection_failure(id, error, cx);
+    }
+
+    fn record_connection_failure(&mut self, id: &ContextServerId, error: &Arc<str>, cx: &App) {
+        let now = cx.background_executor().now();
+        let backoff = self.restart_backoffs.entry(id.clone()).or_default();
+        backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
+        let exponent = backoff.consecutive_failures.saturating_sub(1).min(5);
+        let delay = (INITIAL_CONTEXT_SERVER_RESTART_DELAY * (1u32 << exponent))
+            .min(MAX_CONTEXT_SERVER_RESTART_DELAY);
+        backoff.retry_at = Some(now + delay);
+        log::warn!(
+            "Context server `{id}` failed {count} consecutive time(s): {error}; next restart allowed in {delay:?}",
+            count = backoff.consecutive_failures
+        );
     }
 
     fn handle_auth_challenge(
@@ -873,6 +1021,7 @@ impl ContextServerStore {
             server_id: id.clone(),
             status: ContextServerStatus::Stopped,
         });
+        cx.notify();
         Ok(())
     }
 
@@ -1681,6 +1830,7 @@ impl ContextServerStore {
             server_id: id,
             status,
         });
+        cx.notify();
     }
 
     fn available_context_servers_changed(&mut self, cx: &mut Context<Self>) {

@@ -4230,8 +4230,10 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
-        if let Some(context_server_instructions) =
-            self.context_server_registry.read(cx).rendered_instructions()
+        if let Some(context_server_instructions) = self
+            .context_server_registry
+            .read(cx)
+            .rendered_instructions()
         {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&context_server_instructions);

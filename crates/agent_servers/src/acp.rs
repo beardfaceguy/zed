@@ -15,7 +15,7 @@ use async_channel;
 use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
-use futures::future::Shared;
+use futures::future::{LocalBoxFuture, Shared};
 use futures::io::BufReader;
 use futures::{AsyncBufReadExt as _, Future, FutureExt as _, StreamExt as _};
 use project::agent_server_store::{
@@ -52,6 +52,14 @@ const SESSION_RETRY_META_KEY: &str = "zed.dev/sessionRetry";
 const SESSION_TRUNCATE_META_KEY: &str = "zed.dev/sessionTruncate";
 const CLIENT_USER_MESSAGE_ID_META_KEY: &str = "zed.dev/clientUserMessageId";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
+const TRANSPORT_RETIREMENT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Debug, Clone, Error)]
+#[error("Agent `{agent_id}` connection is no longer available: {reason}")]
+pub struct AcpConnectionRetired {
+    pub agent_id: AgentId,
+    pub reason: LoadError,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[serde(rename_all = "camelCase")]
@@ -429,6 +437,9 @@ pub struct AcpConnection {
     _io_task: Task<()>,
     _dispatch_task: Task<()>,
     _wait_task: Task<Result<()>>,
+    retirement_tx: Arc<Mutex<Option<watch::Sender<Option<LoadError>>>>>,
+    retirement_rx: watch::Receiver<Option<LoadError>>,
+    _retirement_task: Task<Result<()>>,
     _stderr_task: Task<Result<()>>,
 }
 
@@ -949,9 +960,16 @@ impl AcpConnection {
         let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
         let connection_future =
             connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
+        let (retirement_tx, retirement_rx) = watch::channel(None);
+        let retirement_tx = Arc::new(Mutex::new(Some(retirement_tx)));
+        let (transport_retirement_tx, transport_retirement_rx) = async_channel::bounded(1);
         let io_task = cx.background_spawn(async move {
-            if let Err(err) = connection_future.await {
-                log::error!("ACP connection error: {err}");
+            let load_error = match connection_future.await {
+                Ok(()) => LoadError::Other("ACP transport closed".into()),
+                Err(error) => LoadError::Other(format!("ACP transport failed: {error}").into()),
+            };
+            if transport_retirement_tx.send(load_error).await.is_err() {
+                log::debug!("ACP transport retirement receiver was dropped");
             }
         });
 
@@ -1033,12 +1051,30 @@ impl AcpConnection {
         }
 
         let wait_task = cx.spawn({
-            let sessions = sessions.clone();
+            let agent_id = agent_id.clone();
+            let retirement_tx = retirement_tx.clone();
             async move |cx| {
-                let load_error = status_fut.await?;
-                emit_load_error_to_all_sessions(&sessions, load_error, cx);
-                anyhow::Ok(())
+                let (load_error, pending_status) = select_retirement_error(
+                    status_fut,
+                    transport_retirement_rx,
+                    cx.background_executor().clone(),
+                )
+                .await;
+                retire_acp_connection(&agent_id, &retirement_tx, load_error);
+                if let Some(status) = pending_status
+                    && let Err(error) = status.await
+                {
+                    log::warn!(
+                        "failed to collect agent server exit after transport retirement: {error}"
+                    );
+                }
+                Ok(())
             }
+        });
+        let retirement_task = cx.spawn({
+            let sessions = sessions.clone();
+            let retirement_rx = retirement_rx.clone();
+            async move |cx| emit_retirement_to_all_sessions(retirement_rx, sessions, cx).await
         });
 
         let agent_info = response.agent_info;
@@ -1116,6 +1152,9 @@ impl AcpConnection {
             _io_task: io_task,
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
+            retirement_tx,
+            retirement_rx,
+            _retirement_task: retirement_task,
             _stderr_task: stderr_task,
             child: Some(child),
         })
@@ -1139,6 +1178,13 @@ impl AcpConnection {
         let agent_id = AgentId::new("test");
         let defaults = AcpConnectionDefaults::default();
         let settings_subscription = defaults.observe_settings(agent_id.clone(), cx);
+        let (retirement_tx, retirement_rx) = watch::channel(None);
+        let retirement_tx = Arc::new(Mutex::new(Some(retirement_tx)));
+        let retirement_task = cx.spawn({
+            let sessions = sessions.clone();
+            let retirement_rx = retirement_rx.clone();
+            async move |cx| emit_retirement_to_all_sessions(retirement_rx, sessions, cx).await
+        });
 
         Self {
             id: agent_id,
@@ -1159,8 +1205,20 @@ impl AcpConnection {
             _io_task: io_task,
             _dispatch_task: dispatch_task,
             _wait_task: Task::ready(Ok(())),
+            retirement_tx,
+            retirement_rx,
+            _retirement_task: retirement_task,
             _stderr_task: Task::ready(Ok(())),
         }
+    }
+
+    fn retirement_error(&self) -> Option<AcpConnectionRetired> {
+        let mut retirement_rx = self.retirement_rx.clone();
+        let reason = retirement_rx.borrow().clone();
+        Some(AcpConnectionRetired {
+            agent_id: self.id.clone(),
+            reason: reason?,
+        })
     }
 
     fn session_directories_from_work_dirs(
@@ -1187,6 +1245,10 @@ impl AcpConnection {
         + 'static,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
+        if let Some(error) = self.retirement_error() {
+            return Task::ready(Err(error.into()));
+        }
+
         // Check `pending_sessions` before `sessions` because the session is now
         // inserted into `sessions` before the load RPC completes (so that
         // notifications dispatched during history replay can find the thread).
@@ -1553,6 +1615,83 @@ fn emit_load_error_to_all_sessions(
     }
 }
 
+fn retire_acp_connection(
+    agent_id: &AgentId,
+    retirement_tx: &Arc<Mutex<Option<watch::Sender<Option<LoadError>>>>>,
+    error: LoadError,
+) {
+    let mut retirement_tx = match retirement_tx.lock() {
+        Ok(retirement_tx) => retirement_tx,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(mut retirement_tx) = retirement_tx.take() else {
+        return;
+    };
+
+    log::error!("ACP connection for agent `{agent_id}` retired: {error}");
+    retirement_tx.send(Some(error)).log_err();
+}
+
+fn child_status_load_error(status: Result<LoadError>) -> LoadError {
+    match status {
+        Ok(load_error) => load_error,
+        Err(error) => LoadError::Other(error.to_string().into()),
+    }
+}
+
+async fn select_retirement_error(
+    status_fut: LocalBoxFuture<'static, Result<LoadError>>,
+    transport_retirement_rx: async_channel::Receiver<LoadError>,
+    executor: gpui::BackgroundExecutor,
+) -> (
+    LoadError,
+    Option<LocalBoxFuture<'static, Result<LoadError>>>,
+) {
+    let transport_retirement = transport_retirement_rx.recv().boxed_local();
+    match futures::future::select(status_fut, transport_retirement).await {
+        futures::future::Either::Left((status, _transport_retirement)) => {
+            (child_status_load_error(status), None)
+        }
+        futures::future::Either::Right((transport_error, status_fut)) => {
+            let Ok(transport_error) = transport_error else {
+                return (child_status_load_error(status_fut.await), None);
+            };
+            let timer = executor.timer(TRANSPORT_RETIREMENT_DELAY).boxed_local();
+            match futures::future::select(status_fut, timer).await {
+                futures::future::Either::Left((status, _timer)) => {
+                    (child_status_load_error(status), None)
+                }
+                futures::future::Either::Right(((), status_fut)) => {
+                    // Retire the unusable transport now, but preserve the status
+                    // future so the child is still collected when it exits.
+                    (transport_error, Some(status_fut))
+                }
+            }
+        }
+    }
+}
+
+async fn emit_retirement_to_all_sessions(
+    mut retirement_rx: watch::Receiver<Option<LoadError>>,
+    sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let current_error = {
+        let current_error = retirement_rx.borrow().clone();
+        current_error
+    };
+    let error = match current_error {
+        Some(error) => error,
+        None => retirement_rx
+            .recv()
+            .await
+            .context("ACP retirement signal closed unexpectedly")?
+            .context("ACP retirement signal did not include an error")?,
+    };
+    emit_load_error_to_all_sessions(&sessions, error, cx);
+    Ok(())
+}
+
 impl Drop for AcpConnection {
     fn drop(&mut self) {
         if let Some(ref mut child) = self.child {
@@ -1753,9 +1892,7 @@ impl acp_thread::AgentSessionTruncate for AcpSessionTruncate {
                 .unwrap_or(false);
             match result {
                 Ok(_) => Ok(()),
-                Err(error) if suppress_abort_err && is_abort_error(&error) => {
-                    Ok(())
-                }
+                Err(error) if suppress_abort_err && is_abort_error(&error) => Ok(()),
                 Err(error) => Err(map_acp_error_with_details(error)),
             }
         })
@@ -1803,12 +1940,20 @@ impl AgentConnection for AcpConnection {
         self.agent_version.clone()
     }
 
+    fn retirement(&self) -> Option<watch::Receiver<Option<LoadError>>> {
+        Some(self.retirement_rx.clone())
+    }
+
     fn new_session(
         self: Rc<Self>,
         project: Entity<Project>,
         work_dirs: PathList,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
+        if let Some(error) = self.retirement_error() {
+            return Task::ready(Err(error.into()));
+        }
+
         let directories = match self.session_directories_from_work_dirs(&work_dirs) {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
@@ -2052,6 +2197,9 @@ impl AgentConnection for AcpConnection {
                 self.pending_sessions.borrow_mut().remove(session_id);
                 self.sessions.borrow_mut().remove(session_id);
 
+                if let Some(error) = self.retirement_error() {
+                    return Task::ready(Err(error.into()));
+                }
                 let conn = self.connection.clone();
                 let session_id = session_id.clone();
                 return cx.foreground_executor().spawn(async move {
@@ -2078,6 +2226,9 @@ impl AgentConnection for AcpConnection {
         sessions.remove(session_id);
         drop(sessions);
 
+        if let Some(error) = self.retirement_error() {
+            return Task::ready(Err(error.into()));
+        }
         let conn = self.connection.clone();
         let session_id = session_id.clone();
         cx.foreground_executor().spawn(async move {
@@ -2130,6 +2281,10 @@ impl AgentConnection for AcpConnection {
     }
 
     fn authenticate(&self, method_id: acp::AuthMethodId, cx: &mut App) -> Task<Result<()>> {
+        if let Some(error) = self.retirement_error() {
+            return Task::ready(Err(error.into()));
+        }
+
         let conn = self.connection.clone();
         cx.foreground_executor().spawn(async move {
             conn.send_request(acp::AuthenticateRequest::new(method_id))
@@ -2144,6 +2299,10 @@ impl AgentConnection for AcpConnection {
     }
 
     fn logout(&self, cx: &mut App) -> Task<Result<()>> {
+        if let Some(error) = self.retirement_error() {
+            return Task::ready(Err(error.into()));
+        }
+
         if !self.supports_logout() {
             return Task::ready(Err(anyhow!("Logout is not supported by this agent.")));
         }
@@ -2175,6 +2334,10 @@ impl AgentConnection for AcpConnection {
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
+        if let Some(error) = self.retirement_error() {
+            return Task::ready(Err(error.into()));
+        }
+
         let session_id = params.session_id.clone();
         send_prompt_request(
             self.connection.clone(),
@@ -2304,6 +2467,7 @@ pub mod test_support {
 
     #[derive(Clone, Default)]
     pub struct FakeAcpAgentServer {
+        connect_count: Arc<AtomicUsize>,
         load_session_count: Arc<AtomicUsize>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
@@ -2322,6 +2486,10 @@ pub mod test_support {
 
         pub fn load_session_count(&self) -> Arc<AtomicUsize> {
             self.load_session_count.clone()
+        }
+
+        pub fn connect_count(&self) -> Arc<AtomicUsize> {
+            self.connect_count.clone()
         }
 
         pub fn close_session_count(&self) -> Arc<AtomicUsize> {
@@ -2377,6 +2545,7 @@ pub mod test_support {
             project: Entity<Project>,
             cx: &mut App,
         ) -> Task<anyhow::Result<Rc<dyn AgentConnection>>> {
+            self.connect_count.fetch_add(1, Ordering::SeqCst);
             let load_session_count = self.load_session_count.clone();
             let close_session_count = self.close_session_count.clone();
             let fail_next_prompt = self.fail_next_prompt.clone();
@@ -2400,16 +2569,17 @@ pub mod test_support {
                 *exit_status_sender
                     .lock()
                     .expect("exit status sender lock should not be poisoned") = Some(exit_tx);
-                let connection = harness.connection.clone();
-                let simulate_exit_task = cx.spawn(async move |cx| {
+                let agent_id = harness.connection.id.clone();
+                let retirement_tx = harness.connection.retirement_tx.clone();
+                let simulate_exit_task = cx.spawn(async move |_cx| {
                     while let Ok(status) = exit_rx.recv().await {
-                        emit_load_error_to_all_sessions(
-                            &connection.sessions,
+                        retire_acp_connection(
+                            &agent_id,
+                            &retirement_tx,
                             LoadError::Exited {
                                 status,
                                 stderr: None,
                             },
-                            cx,
                         );
                     }
                     Ok(())
@@ -2453,6 +2623,10 @@ pub mod test_support {
 
         fn agent_version(&self) -> Option<SharedString> {
             self.inner.agent_version()
+        }
+
+        fn retirement(&self) -> Option<watch::Receiver<Option<LoadError>>> {
+            self.inner.retirement()
         }
 
         fn new_session(
@@ -2937,6 +3111,81 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn child_status_wins_during_transport_retirement_grace(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (transport_tx, transport_rx) = async_channel::bounded(1);
+        transport_tx
+            .send(LoadError::Other("transport".into()))
+            .await
+            .expect("transport retirement receiver should be alive");
+        let executor = cx.executor();
+        let status_executor = executor.clone();
+        let status = async move {
+            status_executor
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            Ok(LoadError::Other("status".into()))
+        }
+        .boxed_local();
+        let task =
+            cx.spawn(async move |_| select_retirement_error(status, transport_rx, executor).await);
+
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        let (error, pending_status) = task.await;
+
+        assert!(pending_status.is_none());
+        assert!(matches!(
+            error,
+            LoadError::Other(message) if message.as_ref() == "status"
+        ));
+    }
+
+    #[gpui::test]
+    async fn transport_retires_after_grace_but_child_status_remains_awaited(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (transport_tx, transport_rx) = async_channel::bounded(1);
+        transport_tx
+            .send(LoadError::Other("transport".into()))
+            .await
+            .expect("transport retirement receiver should be alive");
+        let executor = cx.executor();
+        let status_executor = executor.clone();
+        let status = async move {
+            status_executor
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            Ok(LoadError::Other("status".into()))
+        }
+        .boxed_local();
+        let task =
+            cx.spawn(async move |_| select_retirement_error(status, transport_rx, executor).await);
+
+        cx.run_until_parked();
+        cx.executor().advance_clock(TRANSPORT_RETIREMENT_DELAY);
+        let (error, pending_status) = task.await;
+        assert!(matches!(
+            error,
+            LoadError::Other(message) if message.as_ref() == "transport"
+        ));
+
+        let pending_status =
+            pending_status.expect("child status must remain pending so the process is reaped");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        let status = pending_status
+            .await
+            .expect("child status should remain awaitable after transport retirement");
+        assert!(matches!(
+            status,
+            LoadError::Other(message) if message.as_ref() == "status"
+        ));
+    }
+
+    #[gpui::test]
     async fn client_capabilities_include_elicitation_without_acp_beta(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3296,23 +3545,21 @@ mod tests {
 
     #[test]
     fn zed_session_editing_recognizes_only_abort_errors() {
-        assert!(is_abort_error(
-            &acp::Error::internal_error().data(serde_json::json!({
+        assert!(is_abort_error(&acp::Error::internal_error().data(
+            serde_json::json!({
                 "details": "This operation was aborted"
-            }))
-        ));
-        assert!(!is_abort_error(
-            &acp::Error::internal_error().data(serde_json::json!({
+            })
+        )));
+        assert!(!is_abort_error(&acp::Error::internal_error().data(
+            serde_json::json!({
                 "details": "another failure"
-            }))
-        ));
+            })
+        )));
         assert!(!is_abort_error(&acp::Error::invalid_params()));
         assert_eq!(
-            map_acp_error_with_details(
-                acp::Error::internal_error().data(serde_json::json!({
-                    "details": "specific failure"
-                }))
-            )
+            map_acp_error_with_details(acp::Error::internal_error().data(serde_json::json!({
+                "details": "specific failure"
+            })))
             .to_string(),
             "specific failure"
         );
@@ -4683,9 +4930,7 @@ mod tests {
 
     fn selected_option_id(outcome: acp::RequestPermissionOutcome) -> String {
         match outcome {
-            acp::RequestPermissionOutcome::Selected(selected) => {
-                selected.option_id.0.to_string()
-            }
+            acp::RequestPermissionOutcome::Selected(selected) => selected.option_id.0.to_string(),
             acp::RequestPermissionOutcome::Cancelled => panic!("expected selected outcome"),
             _ => panic!("unexpected permission outcome"),
         }
@@ -4712,7 +4957,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Allow, true),
             &options,
         )
-            .expect("expected auto-approve outcome to be selected");
+        .expect("expected auto-approve outcome to be selected");
         assert_eq!(selected_option_id(outcome), "always");
     }
 
@@ -4741,7 +4986,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Allow, true),
             &options,
         )
-            .expect("expected auto-approve outcome to be selected");
+        .expect("expected auto-approve outcome to be selected");
         assert_eq!(selected_option_id(outcome), "once");
     }
 
@@ -4783,7 +5028,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Allow, true),
             &options,
         )
-            .expect("expected auto-approve outcome to be selected");
+        .expect("expected auto-approve outcome to be selected");
         assert_eq!(selected_option_id(outcome), "always_a");
     }
 
@@ -4798,7 +5043,7 @@ mod tests {
             decision(settings::ToolPermissionMode::Deny, false),
             &options,
         )
-            .expect("expected automatic reject outcome");
+        .expect("expected automatic reject outcome");
         assert_eq!(selected_option_id(outcome), "reject_once");
     }
 
@@ -4897,13 +5142,8 @@ mod tests {
             input: String::new(),
         };
         assert_eq!(
-            external_permission_decision(
-                &permissions,
-                "daimonos",
-                Some(&wildcard_allowed),
-                false,
-            )
-            .mode,
+            external_permission_decision(&permissions, "daimonos", Some(&wildcard_allowed), false,)
+                .mode,
             settings::ToolPermissionMode::Deny,
             "agent-wide rule must precede cross-agent wildcard tool rule"
         );

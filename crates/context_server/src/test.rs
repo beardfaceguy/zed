@@ -68,6 +68,10 @@ impl FakeTransport {
             .expect("FakeTransport receive channel has been dropped");
     }
 
+    pub fn disconnect(&self) {
+        self.tx.close_channel();
+    }
+
     pub fn on_request<T, Fut>(
         mut self,
         handler: impl 'static + Send + Sync + Fn(T::Params) -> Fut,
