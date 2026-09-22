@@ -1243,13 +1243,18 @@ impl ConversationView {
         let available_skills = connection
             .clone()
             .downcast::<agent::NativeAgentConnection>()
-            .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
-            .unwrap_or_default();
-        let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
-            thread.read(cx).prompt_capabilities(),
-            thread.read(cx).available_commands().to_vec(),
-            available_skills,
-        )));
+            .map(|native_connection| native_available_skills(&native_connection, &session_id, cx));
+        let session_capabilities = Arc::new(RwLock::new(match available_skills {
+            Some(available_skills) => SessionCapabilities::new(
+                thread.read(cx).prompt_capabilities(),
+                thread.read(cx).available_commands().to_vec(),
+                available_skills,
+            ),
+            None => SessionCapabilities::from_acp_commands(
+                thread.read(cx).prompt_capabilities(),
+                thread.read(cx).available_commands().to_vec(),
+            ),
+        }));
 
         let action_log = thread.read(cx).action_log().clone();
 
@@ -1812,17 +1817,28 @@ impl ConversationView {
             }
             AcpThreadEvent::AvailableCommandsUpdated(available_commands) => {
                 if let Some(thread_view) = self.thread_view(&session_id) {
-                    let available_skills = thread
+                    let native_skills = thread
                         .read(cx)
                         .connection()
                         .clone()
                         .downcast::<agent::NativeAgentConnection>()
                         .map(|native_connection| {
                             native_available_skills(&native_connection, &session_id, cx)
-                        })
-                        .unwrap_or_default();
+                        });
+                    let (commands, available_skills) = if let Some(skills) = native_skills {
+                        (available_commands.clone(), skills)
+                    } else {
+                        let split = SessionCapabilities::from_acp_commands(
+                            thread.read(cx).prompt_capabilities(),
+                            available_commands.clone(),
+                        );
+                        (
+                            split.available_commands().to_vec(),
+                            split.available_skills().to_vec(),
+                        )
+                    };
                     let has_slash_completions =
-                        !available_commands.is_empty() || !available_skills.is_empty();
+                        !commands.is_empty() || !available_skills.is_empty();
 
                     let agent_display_name = self
                         .agent_server_store
@@ -1835,7 +1851,7 @@ impl ConversationView {
 
                     thread_view.update(cx, |thread_view, cx| {
                         let mut session_capabilities = thread_view.session_capabilities.write();
-                        session_capabilities.set_available_commands(available_commands.clone());
+                        session_capabilities.set_available_commands(commands);
                         session_capabilities.set_available_skills(available_skills);
                         thread_view.message_editor.update(cx, |editor, cx| {
                             editor.set_placeholder_text(&new_placeholder, window, cx);
@@ -3246,6 +3262,7 @@ fn native_available_skills(
             source: skill.source,
             skill_file_path: skill.skill_file_path,
             warning: skill.warning,
+            external_acp: false,
         })
         .collect()
 }
