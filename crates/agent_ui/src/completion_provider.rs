@@ -338,6 +338,10 @@ fn session_title(title: Option<SharedString>) -> SharedString {
         .unwrap_or_else(|| SharedString::new_static(DEFAULT_THREAD_TITLE))
 }
 
+fn keep_external_skill_as_plain_text(_: CompletionIntent, _: &mut Window, _: &mut App) -> bool {
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct AvailableSkill {
     pub name: Arc<str>,
@@ -347,6 +351,9 @@ pub struct AvailableSkill {
     pub source: SharedString,
     pub skill_file_path: PathBuf,
     pub warning: Option<SharedString>,
+    /// External ACP skills are invoked as slash commands so their owning agent
+    /// can load the instructions and preserve trailing arguments.
+    pub external_acp: bool,
 }
 
 fn skill_completion_icon_path(
@@ -1464,6 +1471,25 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                             candidates
                                 .into_iter()
                                 .map(|candidate| match &candidate {
+                                    SlashCompletionCandidate::Skill(skill)
+                                        if skill.external_acp =>
+                                    {
+                                        let new_text = format!("/{} ", skill.name);
+                                        let confirm: Arc<
+                                            dyn Fn(CompletionIntent, &mut Window, &mut App) -> bool
+                                                + Send
+                                                + Sync,
+                                        > = Arc::new(keep_external_skill_as_plain_text);
+                                        (
+                                            candidate,
+                                            Some((
+                                                new_text,
+                                                IconName::Code.path().into(),
+                                                None,
+                                                confirm,
+                                            )),
+                                        )
+                                    }
                                     SlashCompletionCandidate::Skill(skill) => {
                                         let uri = MentionUri::Skill {
                                             name: skill.name.to_string(),
