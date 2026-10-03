@@ -741,6 +741,10 @@ pub enum CustomAgentServerSettings {
     Custom {
         #[serde(rename = "command")]
         path: PathBuf,
+        /// Absolute path to an SVG icon for this custom agent. When omitted, Zed uses
+        /// the default sparkle icon.
+        /// Default: null
+        icon: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
         /// Default: {}
@@ -932,6 +936,35 @@ impl std::fmt::Display for ToolPermissionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_agent_icon_is_optional_and_round_trips() {
+        let bare = serde_json::json!({"type": "custom", "command": "/usr/bin/agent"});
+        let without_icon: CustomAgentServerSettings = serde_json::from_value(bare).unwrap();
+        assert!(matches!(
+            without_icon,
+            CustomAgentServerSettings::Custom { icon: None, .. }
+        ));
+
+        let with_icon = serde_json::json!({
+            "type": "custom",
+            "command": "/usr/bin/agent",
+            "icon": "/tmp/agent-icon.svg"
+        });
+        let parsed: CustomAgentServerSettings = serde_json::from_value(with_icon.clone()).unwrap();
+        assert!(
+            matches!(&parsed, CustomAgentServerSettings::Custom { icon: Some(path), .. }
+            if path == std::path::Path::new("/tmp/agent-icon.svg"))
+        );
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert_eq!(serialized["icon"], with_icon["icon"]);
+        assert!(
+            serde_json::to_value(without_icon)
+                .unwrap()
+                .get("icon")
+                .is_none()
+        );
+    }
 
     #[test]
     fn agent_config_option_value_serializes_value_id_as_string() {

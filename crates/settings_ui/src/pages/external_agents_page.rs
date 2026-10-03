@@ -336,8 +336,9 @@ pub(crate) struct CustomAgentForm {
     command: Entity<Editor>,
     args: Entity<Editor>,
     env: Vec<KeyValueRow>,
-    /// Advanced fields not surfaced by the form. They're preserved verbatim so
-    /// editing the basic settings doesn't drop a user's hand-written config.
+    icon: Option<std::path::PathBuf>,
+    /// Advanced fields (including `icon`) not surfaced by the form are preserved
+    /// verbatim so editing the basic settings doesn't drop hand-written config.
     default_mode: Option<String>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     favorite_config_option_values: HashMap<String, Vec<String>>,
@@ -360,6 +361,7 @@ impl CustomAgentForm {
 
         let mut command_initial = None;
         let mut args_initial = None;
+        let mut icon = None;
         let mut env = Vec::new();
         let mut default_mode = None;
         let mut default_config_options = HashMap::default();
@@ -371,6 +373,7 @@ impl CustomAgentForm {
             match settings {
                 CustomAgentServerSettings::Custom {
                     path,
+                    icon: custom_icon,
                     args,
                     env: env_map,
                     default_mode: mode,
@@ -378,6 +381,7 @@ impl CustomAgentForm {
                     favorite_config_option_values: favorites,
                 } => {
                     command_initial = Some(path.to_string_lossy().to_string());
+                    icon = custom_icon.clone();
                     if !args.is_empty() {
                         args_initial = Some(args.join(" "));
                     }
@@ -410,6 +414,7 @@ impl CustomAgentForm {
             command: new_input("/path/to/agent", command_initial.as_deref(), window, cx),
             args: new_input("--flag value", args_initial.as_deref(), window, cx),
             env,
+            icon,
             default_mode,
             default_config_options,
             favorite_config_option_values,
@@ -784,6 +789,7 @@ struct CustomAgentFormValues {
     command: String,
     args: String,
     env: Vec<(String, String)>,
+    icon: Option<std::path::PathBuf>,
     default_mode: Option<String>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     favorite_config_option_values: HashMap<String, Vec<String>>,
@@ -799,6 +805,7 @@ fn build_settings_from_form(
         command: form.command.read(cx).text(cx),
         args: form.args.read(cx).text(cx),
         env: read_kv(&form.env, cx),
+        icon: form.icon.clone(),
         default_mode: form.default_mode.clone(),
         default_config_options: form.default_config_options.clone(),
         favorite_config_option_values: form.favorite_config_option_values.clone(),
@@ -836,6 +843,7 @@ fn build_settings_from_values(
         path: command.into(),
         args,
         env,
+        icon: values.icon,
         default_mode: values.default_mode,
         default_config_options: values.default_config_options,
         favorite_config_option_values: values.favorite_config_option_values,
@@ -954,6 +962,7 @@ async fn add_custom_agent_settings_entry(
                                 path: "path_to_executable".into(),
                                 args: vec![],
                                 env: HashMap::default(),
+                                icon: None,
                                 default_mode: None,
                                 default_config_options: Default::default(),
                                 favorite_config_option_values: Default::default(),
@@ -1051,6 +1060,7 @@ mod tests {
             command: "/usr/bin/agent".into(),
             args: String::new(),
             env: Vec::new(),
+            icon: None,
             default_mode: None,
             default_config_options: HashMap::default(),
             favorite_config_option_values: HashMap::default(),
@@ -1118,6 +1128,7 @@ mod tests {
                 path: "/usr/bin/agent".into(),
                 args: vec!["--flag".into(), "value".into()],
                 env: expected_env,
+                icon: None,
                 default_mode: None,
                 default_config_options: HashMap::default(),
                 favorite_config_option_values: HashMap::default(),
@@ -1128,6 +1139,7 @@ mod tests {
     #[test]
     fn preserves_advanced_fields() {
         let mut values = values();
+        values.icon = Some("/tmp/custom.svg".into());
         values.default_mode = Some("ask".into());
         values.default_config_options =
             HashMap::from_iter([("opt".to_string(), AgentConfigOptionValue::from("val"))]);
@@ -1135,10 +1147,15 @@ mod tests {
         let (_, _, content) = build_settings_from_values(values).unwrap();
         match content {
             CustomAgentServerSettings::Custom {
+                icon,
                 default_mode,
                 default_config_options,
                 ..
             } => {
+                assert_eq!(
+                    icon.as_deref(),
+                    Some(std::path::Path::new("/tmp/custom.svg"))
+                );
                 assert_eq!(default_mode.as_deref(), Some("ask"));
                 assert_eq!(
                     default_config_options

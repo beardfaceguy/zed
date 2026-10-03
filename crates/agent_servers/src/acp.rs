@@ -4095,6 +4095,7 @@ mod tests {
                     "test".to_string(),
                     settings::CustomAgentServerSettings::Custom {
                         path: PathBuf::from("test-agent"),
+                        icon: None,
                         args: Vec::new(),
                         env: HashMap::default(),
                         default_mode: Some("manual".to_string()),

@@ -358,7 +358,7 @@ impl AgentServerStore {
 
         for (name, settings) in new_settings.iter() {
             match settings {
-                CustomAgentServerSettings::Custom { command, .. } => {
+                CustomAgentServerSettings::Custom { command, icon, .. } => {
                     let agent_name = AgentId(name.clone().into());
                     self.external_agents.insert(
                         agent_name.clone(),
@@ -368,7 +368,8 @@ impl AgentServerStore {
                                 project_environment: project_environment.clone(),
                             }) as Box<dyn ExternalAgentServer>,
                             ExternalAgentSource::Custom,
-                            None,
+                            icon.as_ref()
+                                .map(|path| path.to_string_lossy().to_string().into()),
                             None,
                         ),
                     );
@@ -1525,6 +1526,7 @@ impl AllAgentServersSettings {
 pub enum CustomAgentServerSettings {
     Custom {
         command: AgentServerCommand,
+        icon: Option<PathBuf>,
         /// The default mode to use for this agent.
         ///
         /// Note: Not only all agents support modes.
@@ -1619,6 +1621,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
         match value {
             settings::CustomAgentServerSettings::Custom {
                 path,
+                icon,
                 args,
                 env,
                 default_mode,
@@ -1630,6 +1633,9 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                     args,
                     env: Some(env),
                 },
+                icon: icon.map(|path| {
+                    PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref())
+                }),
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
@@ -1824,6 +1830,52 @@ mod tests {
                 )
             })
         })
+    }
+
+    #[gpui::test]
+    fn custom_agent_icon_is_registered(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        cx.update(|cx| {
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(HashMap::from_iter([(
+                    "my-agent".to_string(),
+                    settings::CustomAgentServerSettings::Custom {
+                        path: PathBuf::from("/usr/bin/agent"),
+                        icon: Some(PathBuf::from("/tmp/custom.svg")),
+                        args: Vec::new(),
+                        env: HashMap::default(),
+                        default_mode: None,
+                        default_config_options: HashMap::default(),
+                        favorite_config_option_values: HashMap::default(),
+                    }
+                    .into(),
+                )])),
+                cx,
+            );
+        });
+        let store = create_agent_server_store(cx);
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.agent_icon(&AgentId::new("my-agent")).as_deref(),
+                Some("/tmp/custom.svg")
+            );
+        });
+    }
+
+    #[test]
+    fn custom_agent_icon_path_expands_home() {
+        let raw: settings::CustomAgentServerSettings = serde_json::from_value(serde_json::json!({
+            "type": "custom",
+            "command": "/usr/bin/agent",
+            "icon": "~/icons/my-agent.svg"
+        }))
+        .unwrap();
+        let parsed = CustomAgentServerSettings::from(raw);
+        let CustomAgentServerSettings::Custom { icon, .. } = parsed else {
+            panic!("expected custom agent")
+        };
+        let expected = PathBuf::from(shellexpand::tilde("~/icons/my-agent.svg").as_ref());
+        assert_eq!(icon.as_deref(), Some(expected.as_path()));
     }
 
     #[test]

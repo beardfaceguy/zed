@@ -143,12 +143,18 @@ Open [Agent Settings](./agent-settings.md), go to the **External Agents** page, 
     "my-agent": {
       "type": "custom",
       "command": "node",
+      "icon": "/absolute/path/to/agent-icon.svg",
       "args": ["~/projects/agent/index.js", "--acp"],
       "env": {}
     }
   }
 }
 ```
+
+The optional `icon` must point to a local SVG file. It is displayed in the agent
+selector, the selected-agent indicator, and the External Agents settings page.
+Omit it to use the default sparkle icon. Zed does not obtain this icon from the
+ACP server; it is a local custom-agent setting.
 
 Registry-installed agents can also have per-agent settings under `agent_servers.<agent-id>`.
 
