@@ -168,8 +168,7 @@ fn split_acp_skills(
             .get(ACP_SKILL_META_SOURCE)
             .and_then(|value| value.as_str())
         {
-            Some("global") => "",
-            Some("workspace") => "workspace",
+            Some("global" | "workspace") => "",
             _ => {
                 commands.push(command);
                 continue;
@@ -2339,7 +2338,7 @@ mod tests {
             ))
             .meta(acp::Meta::from_iter([
                 (ACP_SKILL_META_KIND.into(), json!(true)),
-                (ACP_SKILL_META_SOURCE.into(), json!("global")),
+                (ACP_SKILL_META_SOURCE.into(), json!("workspace")),
                 (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
             ]));
         let capabilities = SessionCapabilities::from_acp_commands(
