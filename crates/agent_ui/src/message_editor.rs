@@ -36,7 +36,7 @@ use project::{
 };
 use rope::Point;
 use settings::Settings;
-use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
+use std::{cmp::min, fmt::Write, ops::Range, path::PathBuf, rc::Rc, sync::Arc};
 use text::LineEnding;
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, prelude::*};
@@ -69,7 +69,8 @@ impl SessionCapabilities {
         prompt_capabilities: acp::PromptCapabilities,
         available_commands: Vec<acp::AvailableCommand>,
     ) -> Self {
-        Self::new(prompt_capabilities, available_commands, Vec::new())
+        let (available_commands, available_skills) = split_acp_skills(available_commands);
+        Self::new(prompt_capabilities, available_commands, available_skills)
     }
 
     pub fn supports_images(&self) -> bool {
@@ -136,6 +137,70 @@ impl SessionCapabilities {
     pub fn set_available_skills(&mut self, available_skills: Vec<AvailableSkill>) {
         self.available_skills = available_skills;
     }
+}
+
+const ACP_SKILL_META_KIND: &str = "io.daimonos.skill";
+const ACP_SKILL_META_SOURCE: &str = "io.daimonos.skill.source";
+const ACP_SKILL_META_PATH: &str = "io.daimonos.skill.path";
+
+fn is_external_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn split_acp_skills(
+    available_commands: Vec<acp::AvailableCommand>,
+) -> (Vec<acp::AvailableCommand>, Vec<AvailableSkill>) {
+    let mut commands = Vec::new();
+    let mut skills = Vec::new();
+    for command in available_commands {
+        let Some(meta) = command.meta.as_ref() else {
+            commands.push(command);
+            continue;
+        };
+        if meta.get(ACP_SKILL_META_KIND) != Some(&serde_json::json!(true)) {
+            commands.push(command);
+            continue;
+        }
+        if !is_external_skill_name(&command.name) {
+            commands.push(command);
+            continue;
+        }
+        let Some(path) = meta
+            .get(ACP_SKILL_META_PATH)
+            .and_then(|value| value.as_str())
+        else {
+            commands.push(command);
+            continue;
+        };
+        let source = match meta
+            .get(ACP_SKILL_META_SOURCE)
+            .and_then(|value| value.as_str())
+        {
+            // The ACP agent owns workspace/global precedence and receives an
+            // unscoped `/name` invocation, so Zed must not synthesize a native
+            // worktree scope from this presentation-only source label.
+            Some("global" | "workspace") => "",
+            _ => {
+                commands.push(command);
+                continue;
+            }
+        };
+        skills.push(AvailableSkill {
+            name: command.name.into(),
+            description: command.description.into(),
+            source: source.into(),
+            skill_file_path: PathBuf::from(path),
+            warning: None,
+            external_acp: true,
+        });
+    }
+    (commands, skills)
 }
 
 pub type SharedSessionCapabilities = Arc<RwLock<SessionCapabilities>>;
@@ -2277,9 +2342,59 @@ mod tests {
         conversation_view::tests::init_test,
         mention_set::insert_crease_for_mention,
         message_editor::{
-            Mention, MessageEditor, MessageEditorEvent, SessionCapabilities, parse_mention_links,
+            ACP_SKILL_META_KIND, ACP_SKILL_META_PATH, ACP_SKILL_META_SOURCE, Mention,
+            MessageEditor, MessageEditorEvent, SessionCapabilities, parse_mention_links,
         },
     };
+
+    #[test]
+    fn test_external_acp_skill_metadata_populates_skills_not_commands() {
+        let skill = acp::AvailableCommand::new("deploy", "Deploy the app")
+            .input(acp::AvailableCommandInput::Unstructured(
+                acp::UnstructuredCommandInput::new("<arguments>"),
+            ))
+            .meta(acp::Meta::from_iter([
+                (ACP_SKILL_META_KIND.into(), json!(true)),
+                (ACP_SKILL_META_SOURCE.into(), json!("workspace")),
+                (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
+            ]));
+        let capabilities = SessionCapabilities::from_acp_commands(
+            acp::PromptCapabilities::default(),
+            vec![acp::AvailableCommand::new("help", "Get help"), skill],
+        );
+
+        assert_eq!(capabilities.available_commands().len(), 1);
+        assert_eq!(capabilities.available_commands()[0].name, "help");
+        assert_eq!(capabilities.available_skills().len(), 1);
+        assert_eq!(capabilities.available_skills()[0].name.as_ref(), "deploy");
+        assert_eq!(capabilities.available_skills()[0].source.as_ref(), "");
+        assert_eq!(
+            capabilities.available_skills()[0].skill_file_path,
+            PathBuf::from("/tmp/deploy/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_malformed_external_skill_metadata_remains_a_command() {
+        let malformed =
+            acp::AvailableCommand::new("deploy", "Deploy").meta(acp::Meta::from_iter([
+                (ACP_SKILL_META_KIND.into(), json!(true)),
+                (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
+                (ACP_SKILL_META_SOURCE.into(), json!("unknown")),
+            ]));
+        let invalid_name =
+            acp::AvailableCommand::new("bad/name", "Deploy").meta(acp::Meta::from_iter([
+                (ACP_SKILL_META_KIND.into(), json!(true)),
+                (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
+                (ACP_SKILL_META_SOURCE.into(), json!("workspace")),
+            ]));
+        let capabilities = SessionCapabilities::from_acp_commands(
+            acp::PromptCapabilities::default(),
+            vec![malformed, invalid_name],
+        );
+        assert_eq!(capabilities.available_commands().len(), 2);
+        assert!(capabilities.available_skills().is_empty());
+    }
 
     #[test]
     fn test_session_capabilities_keep_commands_and_skills_separate() {
@@ -2290,6 +2405,7 @@ mod tests {
             source: "".into(),
             skill_file_path: skill_file_path.clone(),
             warning: None,
+            external_acp: false,
         };
         let session_capabilities = SessionCapabilities::new(
             acp::PromptCapabilities::default(),
@@ -2347,6 +2463,7 @@ mod tests {
             source: source.into(),
             skill_file_path: PathBuf::from(format!("/tmp/{source}-{name}/SKILL.md")),
             warning: None,
+            external_acp: false,
         };
 
         // Global skills carry an empty scope (so the popup inserts
