@@ -143,6 +143,16 @@ const ACP_SKILL_META_KIND: &str = "io.daimonos.skill";
 const ACP_SKILL_META_SOURCE: &str = "io.daimonos.skill.source";
 const ACP_SKILL_META_PATH: &str = "io.daimonos.skill.path";
 
+fn is_external_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 fn split_acp_skills(
     available_commands: Vec<acp::AvailableCommand>,
 ) -> (Vec<acp::AvailableCommand>, Vec<AvailableSkill>) {
@@ -157,6 +167,10 @@ fn split_acp_skills(
             commands.push(command);
             continue;
         }
+        if !is_external_skill_name(&command.name) {
+            commands.push(command);
+            continue;
+        }
         let Some(path) = meta
             .get(ACP_SKILL_META_PATH)
             .and_then(|value| value.as_str())
@@ -168,6 +182,9 @@ fn split_acp_skills(
             .get(ACP_SKILL_META_SOURCE)
             .and_then(|value| value.as_str())
         {
+            // The ACP agent owns workspace/global precedence and receives an
+            // unscoped `/name` invocation, so Zed must not synthesize a native
+            // worktree scope from this presentation-only source label.
             Some("global" | "workspace") => "",
             _ => {
                 commands.push(command);
@@ -2365,11 +2382,17 @@ mod tests {
                 (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
                 (ACP_SKILL_META_SOURCE.into(), json!("unknown")),
             ]));
+        let invalid_name =
+            acp::AvailableCommand::new("bad/name", "Deploy").meta(acp::Meta::from_iter([
+                (ACP_SKILL_META_KIND.into(), json!(true)),
+                (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
+                (ACP_SKILL_META_SOURCE.into(), json!("workspace")),
+            ]));
         let capabilities = SessionCapabilities::from_acp_commands(
             acp::PromptCapabilities::default(),
-            vec![malformed],
+            vec![malformed, invalid_name],
         );
-        assert_eq!(capabilities.available_commands().len(), 1);
+        assert_eq!(capabilities.available_commands().len(), 2);
         assert!(capabilities.available_skills().is_empty());
     }
 
