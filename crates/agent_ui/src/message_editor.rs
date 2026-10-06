@@ -164,18 +164,21 @@ fn split_acp_skills(
             commands.push(command);
             continue;
         };
-        let source = meta
+        let source = match meta
             .get(ACP_SKILL_META_SOURCE)
             .and_then(|value| value.as_str())
-            .unwrap_or_default();
+        {
+            Some("global") => "",
+            Some("workspace") => "workspace",
+            _ => {
+                commands.push(command);
+                continue;
+            }
+        };
         skills.push(AvailableSkill {
             name: command.name.into(),
             description: command.description.into(),
-            source: if source == "global" {
-                "".into()
-            } else {
-                source.into()
-            },
+            source: source.into(),
             skill_file_path: PathBuf::from(path),
             warning: None,
             external_acp: true,
@@ -2357,9 +2360,12 @@ mod tests {
 
     #[test]
     fn test_malformed_external_skill_metadata_remains_a_command() {
-        let malformed = acp::AvailableCommand::new("deploy", "Deploy").meta(acp::Meta::from_iter(
-            [(ACP_SKILL_META_KIND.into(), json!(true))],
-        ));
+        let malformed =
+            acp::AvailableCommand::new("deploy", "Deploy").meta(acp::Meta::from_iter([
+                (ACP_SKILL_META_KIND.into(), json!(true)),
+                (ACP_SKILL_META_PATH.into(), json!("/tmp/deploy/SKILL.md")),
+                (ACP_SKILL_META_SOURCE.into(), json!("unknown")),
+            ]));
         let capabilities = SessionCapabilities::from_acp_commands(
             acp::PromptCapabilities::default(),
             vec![malformed],
