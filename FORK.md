@@ -32,6 +32,7 @@ Grouped by theme rather than commit order.
 | --- | --- |
 | Bound pending terminal output | ACP terminal scrollback buffers were never freed after a tool call exited, reaching 60–69 MB in a two-minute session against an 83 MB total-leak baseline. Upstream issue [#57099](https://github.com/zed-industries/zed/issues/57099). |
 | Regression tests for terminal scrollback growth, and a display-only scrollback test fixed against the current API | Keeps the above from silently returning. |
+| Refuse oversized automatic file restoration | Prevents saved tabs from decoding huge local files at startup. Recovery text and manual opens retain their policies. See [Vikunja #1590](https://vikunja.wint3rmute.com/tasks/1590) and [the restoration context](crates/editor/CONTEXT.md). |
 
 ### Trust boundaries for external agents
 
@@ -68,6 +69,7 @@ merge was conflict-free, but the hook scripts appear twice in history.
 | Change | Why |
 | --- | --- |
 | Include MCP server instructions in native agent context (PR [#3](https://github.com/beardfaceguy/zed/pull/3)) | Server-provided instructions were being dropped. |
+| Registered loopback callbacks and explicit MCP OAuth scopes | Supports providers that require exact registered redirect URIs. Explicit scopes replace advertised scopes. Tracked in [Vikunja #1547](https://vikunja.wint3rmute.com/tasks/1547). |
 | Advertise a parameterized model picker to all ACP agents (PR [#4](https://github.com/beardfaceguy/zed/pull/4)) | Model selection was limited to specific agents. |
 | Update Agent Client Protocol to 1.2.0 (PR [#5](https://github.com/beardfaceguy/zed/pull/5)) | Protocol version bump. |
 | Expose retry and truncation for capable ACP agents (PR [#6](https://github.com/beardfaceguy/zed/pull/6)) | Surfaces capabilities agents already advertised. |

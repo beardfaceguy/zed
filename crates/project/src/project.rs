@@ -145,9 +145,9 @@ use util::{
 };
 use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
-    Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
-    UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
-    discover_root_repo_common_dir,
+    Entry, EntryKind, FS_WATCH_LATENCY, File, FileSizeLimitExceeded, LocalWorktree, PathChange,
+    ProjectEntryId, UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId,
+    WorktreeSettings, discover_root_repo_common_dir,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
@@ -3124,11 +3124,24 @@ impl Project {
         abs_path: impl AsRef<Path>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        self.open_local_buffer_with_file_size_limit(abs_path, None, cx)
+    }
+
+    pub fn open_local_buffer_with_file_size_limit(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        file_size_limit: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
         let worktree_task = self.find_or_create_worktree(abs_path.as_ref(), false, cx);
         cx.spawn(async move |this, cx| {
             let (worktree, relative_path) = worktree_task.await?;
             this.update(cx, |this, cx| {
-                this.open_buffer((worktree.read(cx).id(), relative_path), cx)
+                this.open_buffer_with_file_size_limit(
+                    (worktree.read(cx).id(), relative_path),
+                    file_size_limit,
+                    cx,
+                )
             })?
             .await
         })
@@ -3220,12 +3233,22 @@ impl Project {
         path: impl Into<ProjectPath>,
         cx: &mut App,
     ) -> Task<Result<Entity<Buffer>>> {
+        self.open_buffer_with_file_size_limit(path, None, cx)
+    }
+
+    /// Limit new local disk reads without changing explicit-open defaults or remote protocols.
+    pub fn open_buffer_with_file_size_limit(
+        &mut self,
+        path: impl Into<ProjectPath>,
+        file_size_limit: Option<u64>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Buffer>>> {
         if self.is_disconnected(cx) {
             return Task::ready(Err(anyhow!(ErrorCode::Disconnected)));
         }
 
         self.buffer_store.update(cx, |buffer_store, cx| {
-            buffer_store.open_buffer(path.into(), cx)
+            buffer_store.open_buffer_with_file_size_limit(path.into(), file_size_limit, cx)
         })
     }
 

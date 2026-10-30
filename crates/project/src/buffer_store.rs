@@ -34,7 +34,10 @@ use worktree::{File, PathChange, ProjectEntryId, Worktree, WorktreeId, WorktreeS
 pub struct BufferStore {
     state: BufferStoreState,
     #[allow(clippy::type_complexity)]
-    loading_buffers: HashMap<ProjectPath, Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>>,
+    loading_buffers: HashMap<
+        (ProjectPath, Option<u64>),
+        Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>,
+    >,
     worktree_store: Entity<WorktreeStore>,
     opened_buffers: HashMap<BufferId, OpenBuffer>,
     path_to_buffer_id: HashMap<ProjectPath, BufferId>,
@@ -640,9 +643,12 @@ impl LocalBufferStore {
         &self,
         path: Arc<RelPath>,
         worktree: Entity<Worktree>,
+        file_size_limit: Option<u64>,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
-        let load_file = worktree.update(cx, |worktree, cx| worktree.load_file(path.as_ref(), cx));
+        let load_file = worktree.update(cx, |worktree, cx| {
+            worktree.load_file_with_size_limit(path.as_ref(), file_size_limit, cx)
+        });
         cx.spawn(async move |this, cx| {
             let path = path.clone();
             let buffer = match load_file.await {
@@ -688,6 +694,16 @@ impl LocalBufferStore {
                 Err(e) => return Err(e),
             };
             this.update(cx, |this, cx| {
+                // Different admission policies can finish concurrently. Publish
+                // only one buffer for a path so edits and unsaved text stay shared.
+                if let Some(file) = File::from_dyn(buffer.read(cx).file())
+                    && let Some(existing) = this.get_by_path(&ProjectPath {
+                        worktree_id: file.worktree_id(cx),
+                        path: file.path.clone(),
+                    })
+                {
+                    return Ok(existing);
+                }
                 this.add_buffer(buffer.clone(), cx)?;
                 let buffer_id = buffer.read(cx).remote_id();
                 if let Some(file) = File::from_dyn(buffer.read(cx).file()) {
@@ -718,10 +734,8 @@ impl LocalBufferStore {
                     }
                 }
 
-                anyhow::Ok(())
-            })??;
-
-            Ok(buffer)
+                anyhow::Ok(buffer)
+            })?
         })
     }
 
@@ -861,11 +875,28 @@ impl BufferStore {
         project_path: ProjectPath,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        self.open_buffer_with_file_size_limit(project_path, None, cx)
+    }
+
+    pub fn open_buffer_with_file_size_limit(
+        &mut self,
+        project_path: ProjectPath,
+        file_size_limit: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
         if let Some(buffer) = self.get_by_path(&project_path) {
             return Task::ready(Ok(buffer));
         }
 
-        let task = match self.loading_buffers.entry(project_path.clone()) {
+        // A recovery/manual open must not share a restore-only refusal.
+        let file_size_limit = match self.state {
+            BufferStoreState::Local(_) => file_size_limit,
+            BufferStoreState::Remote(_) => None,
+        };
+        let task = match self
+            .loading_buffers
+            .entry((project_path.clone(), file_size_limit))
+        {
             hash_map::Entry::Occupied(e) => e.get().clone(),
             hash_map::Entry::Vacant(entry) => {
                 let path = project_path.path.clone();
@@ -877,7 +908,9 @@ impl BufferStore {
                     return Task::ready(Err(anyhow!("no such worktree")));
                 };
                 let load_buffer = match &self.state {
-                    BufferStoreState::Local(this) => this.open_buffer(path, worktree, cx),
+                    BufferStoreState::Local(this) => {
+                        this.open_buffer(path, worktree, file_size_limit, cx)
+                    }
                     BufferStoreState::Remote(this) => this.open_buffer(path, worktree, cx),
                 };
 
@@ -887,7 +920,8 @@ impl BufferStore {
                             let load_result = load_buffer.await;
                             this.update(cx, |this, _cx| {
                                 // Record the fact that the buffer is no longer loading.
-                                this.loading_buffers.remove(&project_path);
+                                this.loading_buffers
+                                    .remove(&(project_path, file_size_limit));
 
                                 let buffer = load_result.map_err(Arc::new)?;
                                 Ok(buffer)
@@ -901,7 +935,9 @@ impl BufferStore {
 
         cx.background_spawn(async move {
             task.await.map_err(|e| {
-                if e.error_code() != ErrorCode::Internal {
+                if let Some(error) = e.downcast_ref::<worktree::FileSizeLimitExceeded>() {
+                    anyhow!(error.clone())
+                } else if e.error_code() != ErrorCode::Internal {
                     anyhow!(e.error_code())
                 } else {
                     anyhow!("{e}")
@@ -1028,7 +1064,7 @@ impl BufferStore {
     pub fn loading_buffers(
         &self,
     ) -> impl Iterator<Item = (&ProjectPath, impl Future<Output = Result<Entity<Buffer>>>)> {
-        self.loading_buffers.iter().map(|(path, task)| {
+        self.loading_buffers.iter().map(|((path, _), task)| {
             let task = task.clone();
             (path, async move {
                 task.await.map_err(|e| {

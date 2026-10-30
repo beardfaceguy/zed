@@ -1,3 +1,5 @@
+//! Editor item persistence. Context: crates/editor/CONTEXT.md.
+
 use crate::{
     ActiveDebugLine, Anchor, Autoscroll, BufferSerialization, Capability, Editor, EditorEvent,
     EditorSettings, ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
@@ -1237,6 +1239,10 @@ impl Item for Editor {
     }
 }
 
+// Automatic restoration is less explicit than a manual open. The approved
+// admission policy lives here, not in the general file loader.
+const AUTO_RESTORE_FILE_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+
 impl SerializableItem for Editor {
     fn serialized_item_kind() -> &'static str {
         "Editor"
@@ -1259,7 +1265,7 @@ impl SerializableItem for Editor {
 
     fn deserialize(
         project: Entity<Project>,
-        _workspace: WeakEntity<Workspace>,
+        workspace: WeakEntity<Workspace>,
         workspace_id: workspace::WorkspaceId,
         item_id: ItemId,
         window: &mut Window,
@@ -1269,21 +1275,7 @@ impl SerializableItem for Editor {
             .get_serialized_editor(item_id, workspace_id)
             .context("Failed to query editor state")
         {
-            Ok(Some(serialized_editor)) => {
-                if ProjectSettings::get_global(cx)
-                    .session
-                    .restore_unsaved_buffers
-                {
-                    serialized_editor
-                } else {
-                    SerializedEditor {
-                        abs_path: serialized_editor.abs_path,
-                        contents: None,
-                        language: None,
-                        mtime: None,
-                    }
-                }
-            }
+            Ok(Some(serialized_editor)) => serialized_editor,
             Ok(None) => {
                 return Task::ready(Err(anyhow!(
                     "Unable to deserialize editor: No entry in database for item_id: {item_id} and workspace_id {workspace_id:?}"
@@ -1291,6 +1283,25 @@ impl SerializableItem for Editor {
             }
             Err(error) => {
                 return Task::ready(Err(error));
+            }
+        };
+        // Never introduce a new rejection for an item with saved recovery text,
+        // even when the user disabled restoring that text in this session.
+        let file_size_limit = serialized_editor
+            .contents
+            .is_none()
+            .then_some(AUTO_RESTORE_FILE_SIZE_LIMIT);
+        let serialized_editor = if ProjectSettings::get_global(cx)
+            .session
+            .restore_unsaved_buffers
+        {
+            serialized_editor
+        } else {
+            SerializedEditor {
+                contents: None,
+                language: None,
+                mtime: None,
+                ..serialized_editor
             }
         };
         log::debug!(
@@ -1357,13 +1368,22 @@ impl SerializableItem for Editor {
                         worktree_id: worktree.read(cx).id(),
                         path: path,
                     };
-                    Some(project.open_path(project_path, cx))
+                    Some(project.open_buffer_with_file_size_limit(
+                        project_path,
+                        file_size_limit,
+                        cx,
+                    ))
                 });
 
                 match opened_buffer {
                     Some(opened_buffer) => window.spawn(cx, async move |cx| {
-                        let (_, buffer) = opened_buffer
+                        let buffer = opened_buffer
                             .await
+                            .inspect_err(|error| {
+                                notify_restore_size_limit(
+                                    error, &abs_path, item_id, &workspace, cx,
+                                );
+                            })
                             .context("Failed to open path in project")?;
 
                         if let Some(contents) = contents {
@@ -1390,8 +1410,19 @@ impl SerializableItem for Editor {
                         // returned item to the correct pane.
                         window.spawn(cx, async move |cx| {
                             let buffer = project
-                                .update(cx, |project, cx| project.open_local_buffer(&abs_path, cx))
+                                .update(cx, |project, cx| {
+                                    project.open_local_buffer_with_file_size_limit(
+                                        &abs_path,
+                                        file_size_limit,
+                                        cx,
+                                    )
+                                })
                                 .await
+                                .inspect_err(|error| {
+                                    notify_restore_size_limit(
+                                        error, &abs_path, item_id, &workspace, cx,
+                                    );
+                                })
                                 .with_context(|| {
                                     format!("Failed to open buffer for {abs_path:?}")
                                 })?;
@@ -1589,6 +1620,34 @@ impl ProjectItem for Editor {
         cx: &mut App,
     ) -> Option<InvalidItemView> {
         Some(InvalidItemView::new(abs_path, is_local, e, window, cx))
+    }
+}
+
+fn notify_restore_size_limit(
+    error: &anyhow::Error,
+    path: &Path,
+    item_id: ItemId,
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    if let Some(limit) = error.downcast_ref::<project::FileSizeLimitExceeded>() {
+        let message = format!(
+            "Skipped automatic restore of {}: {limit}. Open the file manually only if you intend to load it.",
+            path.display()
+        );
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::composite::<
+                            project::FileSizeLimitExceeded,
+                        >(("restore-file-size", item_id)),
+                        message,
+                    ),
+                    cx,
+                );
+            })
+            .log_err();
     }
 }
 
@@ -2699,6 +2758,282 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    #[gpui::test]
+    async fn test_restore_refuses_oversized_file_before_reading(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        let path = Path::new(path!("/dump.sql"));
+        fs.insert_file(path, b"SELECT 1;".to_vec()).await;
+        fs.set_file_size(path, 1_733_563_200);
+        let project = Project::test(fs.clone(), [path], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let db = cx.update(|_, cx| workspace::WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
+        let item_id = 1234 as ItemId;
+        editor_db
+            .save_serialized_editor(
+                item_id,
+                workspace_id,
+                SerializedEditor {
+                    abs_path: Some(path.to_path_buf()),
+                    contents: None,
+                    language: None,
+                    mtime: None,
+                },
+            )
+            .await
+            .unwrap();
+        let reads_before = fs.read_count_for_path(path);
+        let restored = workspace
+            .update_in(cx, |workspace, window, cx| {
+                Editor::deserialize(
+                    project.clone(),
+                    workspace.weak_handle(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await;
+        let error = restored
+            .err()
+            .expect("oversized startup file must not load");
+        let refusal = error
+            .downcast_ref::<project::FileSizeLimitExceeded>()
+            .expect("size refusal must survive the public restore path");
+        assert_eq!(refusal.size, 1_733_563_200);
+        assert_eq!(refusal.limit, 67_108_864);
+        assert!(
+            workspace
+                .read_with(cx, |workspace, _| workspace.notification_ids())
+                .contains(&workspace::notifications::NotificationId::composite::<
+                    project::FileSizeLimitExceeded,
+                >(("restore-file-size", item_id)))
+        );
+        assert_eq!(
+            fs.read_count_for_path(path),
+            reads_before,
+            "refused file must not be read or decoded"
+        );
+        for size in [67_108_865, 67_108_864] {
+            fs.set_file_size(path, size);
+            let restored = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    Editor::deserialize(
+                        project.clone(),
+                        workspace.weak_handle(),
+                        workspace_id,
+                        item_id,
+                        window,
+                        cx,
+                    )
+                })
+                .await;
+            if size > 67_108_864 {
+                assert!(restored.is_err());
+                assert_eq!(fs.read_count_for_path(path), reads_before);
+            } else {
+                assert_eq!(
+                    restored
+                        .unwrap()
+                        .read_with(cx, |editor, cx| editor.text(cx)),
+                    "SELECT 1;"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_file_growth_is_bounded_before_decoding(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        let path = Path::new(path!("/growing.sql"));
+        fs.insert_file(path, vec![b'x'; 32 * 1024]).await;
+        // Metadata is stale while the reader sees the longer contents.
+        fs.set_file_size(path, 1);
+        let project = Project::test(fs.clone(), [path], cx).await;
+        for limit in [32, 16 * 1024] {
+            let before = fs.bytes_read_for_path(path);
+            let result = project
+                .update(cx, |project, cx| {
+                    project.open_local_buffer_with_file_size_limit(path, Some(limit), cx)
+                })
+                .await;
+            let error = result
+                .err()
+                .expect("growth beyond the read limit must fail");
+            let refusal = error
+                .downcast_ref::<project::FileSizeLimitExceeded>()
+                .unwrap();
+            assert_eq!(refusal.limit, limit);
+            assert_eq!(refusal.size, limit + 1);
+            assert_eq!(
+                fs.bytes_read_for_path(path) - before,
+                (limit + 1) as usize,
+                "only the limit plus one sentinel byte may be read"
+            );
+        }
+        fs.insert_file(path, vec![b'x'; 32]).await;
+        fs.set_file_size(path, 1);
+        let admitted = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_file_size_limit(path, Some(32), cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            admitted.read_with(cx, |buffer, _| buffer.text()),
+            "x".repeat(32)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_refusal_preserves_neighboring_tabs_and_unsaved_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use workspace::{
+            TestSerializedItem as SerializedItem, TestSerializedPane as SerializedPane,
+        };
+
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        let root = Path::new(path!("/restore"));
+        fs.insert_tree(
+            root,
+            json!({
+                "oversized.sql": "SELECT 1;",
+                "pinned.txt": "pinned",
+                "active.txt": "disk text",
+                "preview.txt": "preview"
+            }),
+        )
+        .await;
+        fs.set_file_size(root.join("oversized.sql"), 1_733_563_200);
+        // A saved recovery snapshot must not be rejected by the new policy.
+        fs.set_file_size(root.join("active.txt"), 1_733_563_200);
+        let project = Project::test(fs.clone(), [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let db = cx.update(|_, cx| workspace::WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
+        let names = ["oversized.sql", "pinned.txt", "active.txt", "preview.txt"];
+        let mut children = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let item_id = (index + 1) as ItemId;
+            editor_db
+                .save_serialized_editor(
+                    item_id,
+                    workspace_id,
+                    SerializedEditor {
+                        abs_path: Some(root.join(name)),
+                        contents: (index == 2).then(|| "unsaved recovery text".into()),
+                        language: None,
+                        mtime: None,
+                    },
+                )
+                .await
+                .unwrap();
+            children.push(SerializedItem {
+                kind: "Editor".into(),
+                item_id,
+                active: index == 2,
+                preview: index == 3,
+            });
+        }
+        let serialized = SerializedPane::new(children, true, 2);
+        let restored = workspace
+            .update_in(cx, |workspace, window, cx| {
+                let workspace = workspace.weak_handle();
+                let pane = pane.downgrade();
+                window.spawn(cx, async move |cx| {
+                    serialized
+                        .deserialize_to(&project, &pane, workspace_id, workspace, cx)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(restored[0].is_none());
+        let active = restored[2].as_ref().unwrap();
+        let preview = restored[3].as_ref().unwrap();
+        pane.read_with(cx, |pane, _| {
+            assert_eq!(pane.items_len(), 3);
+            assert_eq!(pane.active_item().unwrap().item_id(), active.item_id());
+            assert_eq!(pane.preview_item_id(), Some(preview.item_id()));
+            assert_eq!(pane.pinned_count(), 1);
+        });
+        active
+            .downcast::<Editor>()
+            .unwrap()
+            .read_with(cx, |editor, cx| {
+                assert_eq!(editor.text(cx), "unsaved recovery text");
+                assert!(editor.is_dirty(cx));
+            });
+        workspace
+            .update_in(cx, |_, window, cx| {
+                Editor::cleanup(workspace_id, vec![2, 3, 4], window, cx)
+            })
+            .await
+            .unwrap();
+        let saved = editor_db
+            .get_serialized_editor(3, workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.contents.as_deref(), Some("unsaved recovery text"));
+        assert_eq!(fs.read_count_for_path(root.join("oversized.sql")), 0);
+    }
+
+    #[gpui::test]
+    async fn test_manual_open_does_not_inherit_restore_refusal(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        let path = Path::new(path!("/shared.sql"));
+        fs.insert_file(path, b"SELECT 1;".to_vec()).await;
+        fs.set_file_size(path, 1_733_563_200);
+        let project = Project::test(fs, [path], cx).await;
+        let (limited, manual) = project.update(cx, |project, cx| {
+            let path = project.find_project_path(path, cx).unwrap();
+            (
+                project.open_buffer_with_file_size_limit(path.clone(), Some(67_108_864), cx),
+                project.open_buffer(path, cx),
+            )
+        });
+        let (limited, manual) = futures::join!(limited, manual);
+        assert!(limited.is_err());
+        let buffer = manual
+            .expect("a manual or recovery open must not inherit a concurrent restore refusal");
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "SELECT 1;");
+    }
+
+    #[gpui::test]
+    async fn test_concurrent_admitted_loads_share_one_buffer(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        let path = Path::new(path!("/small.sql"));
+        fs.insert_file(path, b"SELECT 1;".to_vec()).await;
+        let project = Project::test(fs, [path], cx).await;
+        let (limited, manual) = project.update(cx, |project, cx| {
+            let path = project.find_project_path(path, cx).unwrap();
+            (
+                project.open_buffer_with_file_size_limit(path.clone(), Some(32), cx),
+                project.open_buffer(path, cx),
+            )
+        });
+        let (limited, manual) = futures::join!(limited, manual);
+        assert_eq!(
+            limited.unwrap(),
+            manual.unwrap(),
+            "different admission limits must not create independent text buffers for one file"
+        );
     }
 
     #[gpui::test]

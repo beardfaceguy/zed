@@ -85,6 +85,10 @@ pub use pane_group::{
     ActivePaneDecorator, HANDLE_HITBOX_SIZE, Member, PaneAxis, PaneGroup, PaneRenderContext,
     SplitDirection,
 };
+#[cfg(feature = "test-support")]
+pub use persistence::model::{
+    SerializedItem as TestSerializedItem, SerializedPane as TestSerializedPane,
+};
 pub use persistence::{
     RecentWorkspace, WorkspaceDb, delete_unloaded_items,
     model::{

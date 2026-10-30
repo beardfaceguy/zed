@@ -362,7 +362,7 @@ impl SerializedPane {
         let mut item_tasks = Vec::new();
         let mut active_item_index = None;
         let mut preview_item_index = None;
-        for (index, item) in self.children.iter().enumerate() {
+        for item in &self.children {
             let project = project.clone();
             item_tasks.push(pane.update_in(cx, |_, window, cx| {
                 SerializableItemRegistry::deserialize(
@@ -375,20 +375,30 @@ impl SerializedPane {
                     cx,
                 )
             })?);
-            if item.active {
-                active_item_index = Some(index);
-            }
-            if item.preview {
-                preview_item_index = Some(index);
-            }
         }
 
         let mut items = Vec::new();
-        for item_handle in futures::future::join_all(item_tasks).await {
+        let mut restored_count = 0;
+        let mut pinned_count = 0;
+        for (index, item_handle) in futures::future::join_all(item_tasks)
+            .await
+            .into_iter()
+            .enumerate()
+        {
             let item_handle = item_handle.log_err();
             items.push(item_handle.clone());
 
             if let Some(item_handle) = item_handle {
+                // Failed restores do not occupy a tab. Keep surviving tab state
+                // attached to the same item rather than its old serialized index.
+                if self.children[index].active {
+                    active_item_index = Some(restored_count);
+                }
+                if self.children[index].preview {
+                    preview_item_index = Some(restored_count);
+                }
+                pinned_count += usize::from(index < self.pinned_count);
+                restored_count += 1;
                 pane.update_in(cx, |pane, window, cx| {
                     pane.add_item(item_handle.clone(), true, true, None, window, cx);
                 })?;
@@ -409,7 +419,7 @@ impl SerializedPane {
             })?;
         }
         pane.update(cx, |pane, _| {
-            pane.set_pinned_count(self.pinned_count.min(items.len()));
+            pane.set_pinned_count(pinned_count);
         })?;
 
         anyhow::Ok(items)

@@ -58,6 +58,7 @@ use std::{
     ffi::OsStr,
     fmt,
     future::Future,
+    io::Read as _,
     mem::{self},
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
@@ -113,6 +114,32 @@ pub struct LoadedFile {
     pub encoding: &'static Encoding,
     pub has_bom: bool,
     pub is_writable: bool,
+}
+
+/// A caller-specific byte limit rejected a file before text-buffer construction.
+#[derive(Clone, Debug)]
+pub struct FileSizeLimitExceeded {
+    pub size: u64,
+    pub limit: u64,
+}
+
+impl fmt::Display for FileSizeLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "file contains at least {} bytes, exceeding the {} byte limit",
+            self.size, self.limit
+        )
+    }
+}
+
+impl std::error::Error for FileSizeLimitExceeded {}
+
+fn check_file_size(size: u64, limit: Option<u64>) -> Result<()> {
+    if let Some(limit) = limit {
+        anyhow::ensure!(size <= limit, FileSizeLimitExceeded { size, limit });
+    }
+    Ok(())
 }
 
 pub struct LoadedBinaryFile {
@@ -881,8 +908,17 @@ impl Worktree {
     }
 
     pub fn load_file(&self, path: &RelPath, cx: &Context<Worktree>) -> Task<Result<LoadedFile>> {
+        self.load_file_with_size_limit(path, None, cx)
+    }
+
+    pub fn load_file_with_size_limit(
+        &self,
+        path: &RelPath,
+        file_size_limit: Option<u64>,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedFile>> {
         match self {
-            Worktree::Local(this) => this.load_file(path, cx),
+            Worktree::Local(this) => this.load_file(path, file_size_limit, cx),
             Worktree::Remote(_) => {
                 Task::ready(Err(anyhow!("remote worktrees can't yet load files")))
             }
@@ -1646,7 +1682,12 @@ impl LocalWorktree {
     }
 
     #[ztracing::instrument(skip_all)]
-    fn load_file(&self, path: &RelPath, cx: &Context<Worktree>) -> Task<Result<LoadedFile>> {
+    fn load_file(
+        &self,
+        path: &RelPath,
+        file_size_limit: Option<u64>,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<LoadedFile>> {
         let path = Arc::from(path);
         let abs_path = self.absolutize(&path);
         let fs = self.fs.clone();
@@ -1663,12 +1704,16 @@ impl LocalWorktree {
             //       reasonable limit
             const FILE_SIZE_MAX: u64 = 6 * 1024 * 1024 * 1024; // 6GB
             let metadata = fs.metadata(&abs_path).await?;
+            if let Some(metadata) = metadata.as_ref() {
+                check_file_size(metadata.len, file_size_limit)?;
+            }
             if let Some(metadata) = metadata.as_ref()
                 && metadata.len >= FILE_SIZE_MAX
             {
                 anyhow::bail!("File is too large to load");
             }
-            let (text, encoding, has_bom) = decode_file_text(fs.as_ref(), &abs_path).await?;
+            let (text, encoding, has_bom) =
+                decode_file_text(fs.as_ref(), &abs_path, file_size_limit).await?;
             let is_writable = metadata.is_some_and(|metadata| metadata.is_writable);
 
             let worktree = this.upgrade().context("worktree was dropped")?;
@@ -6942,11 +6987,15 @@ impl fs::Watcher for NullWatcher {
 async fn decode_file_text(
     fs: &dyn Fs,
     abs_path: &Path,
+    file_size_limit: Option<u64>,
 ) -> Result<(String, &'static Encoding, bool)> {
-    let mut file = fs
+    let file = fs
         .open_sync(&abs_path)
         .await
         .with_context(|| format!("opening file {abs_path:?}"))?;
+    // Metadata can become stale. Read at most the limit plus a sentinel byte,
+    // and reject that sentinel before decoding or constructing a text buffer.
+    let mut file = file.take(file_size_limit.map_or(u64::MAX, |limit| limit.saturating_add(1)));
 
     // First, read the beginning of the file to determine its kind and encoding.
     // We do not want to load an entire large blob into memory only to discard it.
@@ -6966,6 +7015,7 @@ async fn decode_file_text(
         }
         file_first_bytes.extend_from_slice(&buf[..n]);
     }
+    check_file_size(file_first_bytes.len() as u64, file_size_limit)?;
     let (bom_encoding, byte_content) = decode_byte_header(&file_first_bytes);
     anyhow::ensure!(
         byte_content != ByteContent::Binary,
@@ -6984,6 +7034,7 @@ async fn decode_file_text(
                 break;
             }
             content.extend_from_slice(&buf[..n]);
+            check_file_size(content.len() as u64, file_size_limit)?;
         }
     }
     decode_byte_full(content, bom_encoding, byte_content)

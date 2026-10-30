@@ -1353,11 +1353,34 @@ struct FakeFsState {
     metadata_call_count: usize,
     read_dir_call_count: usize,
     path_write_counts: std::collections::HashMap<PathBuf, usize>,
+    path_read_counts: std::collections::HashMap<PathBuf, usize>,
+    path_bytes_read: std::collections::HashMap<PathBuf, usize>,
     moves: std::collections::HashMap<u64, PathBuf>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Mutex<SlotMap<TrashId, (TrashedEntry, FakeFsEntry)>>,
     file_to_create_before_watch_add: Option<(PathBuf, PathBuf)>,
     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
+}
+
+#[cfg(feature = "test-support")]
+struct FakeFileReader {
+    content: io::Cursor<Vec<u8>>,
+    state: Arc<Mutex<FakeFsState>>,
+    path: PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+impl io::Read for FakeFileReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.content.read(buffer)?;
+        *self
+            .state
+            .lock()
+            .path_bytes_read
+            .entry(self.path.clone())
+            .or_default() += count;
+        Ok(count)
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1673,6 +1696,8 @@ impl FakeFs {
                 read_dir_call_count: 0,
                 metadata_call_count: 0,
                 path_write_counts: Default::default(),
+                path_read_counts: Default::default(),
+                path_bytes_read: Default::default(),
                 moves: Default::default(),
                 job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
                 trash: Mutex::new(SlotMap::with_key()),
@@ -1832,6 +1857,7 @@ impl FakeFs {
         let path = normalize_path(path);
         self.simulate_random_delay().await;
         let mut state = self.state.lock();
+        *state.path_read_counts.entry(path.clone()).or_default() += 1;
         let entry = state.entry(&path)?;
         entry.file_content(&path).cloned()
     }
@@ -2544,6 +2570,39 @@ impl FakeFs {
         self.state.lock().metadata_call_count
     }
 
+    /// Override the reported size without allocating file contents or emitting events.
+    pub fn set_file_size(&self, path: impl AsRef<Path>, size: u64) {
+        match self
+            .state
+            .lock()
+            .entry(&normalize_path(path.as_ref()))
+            .unwrap()
+        {
+            FakeFsEntry::File { len, .. } => *len = size,
+            _ => panic!("expected a file"),
+        }
+    }
+
+    /// How many content reads have been requested for a specific path.
+    pub fn read_count_for_path(&self, path: impl AsRef<Path>) -> usize {
+        self.state
+            .lock()
+            .path_read_counts
+            .get(&normalize_path(path.as_ref()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many bytes have been consumed through synchronous readers for a path.
+    pub fn bytes_read_for_path(&self, path: impl AsRef<Path>) -> usize {
+        self.state
+            .lock()
+            .path_bytes_read
+            .get(&normalize_path(path.as_ref()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// How many write operations have been issued for a specific path.
     pub fn write_count_for_path(&self, path: impl AsRef<Path>) -> usize {
         let path = path.as_ref().to_path_buf();
@@ -3011,7 +3070,11 @@ impl Fs for FakeFs {
 
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
         let bytes = self.load_internal(path).await?;
-        Ok(Box::new(io::Cursor::new(bytes)))
+        Ok(Box::new(FakeFileReader {
+            content: io::Cursor::new(bytes),
+            state: self.state.clone(),
+            path: normalize_path(path),
+        }))
     }
 
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>> {
