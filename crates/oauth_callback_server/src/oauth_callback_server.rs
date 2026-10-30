@@ -154,6 +154,9 @@ mod server {
         pub fallback_port: Option<u16>,
         /// Callback path on the redirect URI (e.g. `/callback`, `/auth/callback`).
         pub path: &'static str,
+        /// Whether a busy fixed port can evict a previous callback listener.
+        /// Registered MCP redirect URIs use false to avoid contacting unrelated services.
+        pub cancel_existing: bool,
     }
 
     impl Default for OAuthCallbackServerConfig {
@@ -163,6 +166,7 @@ mod server {
                 preferred_port: 0,
                 fallback_port: None,
                 path: "/callback",
+                cancel_existing: true,
             }
         }
     }
@@ -376,6 +380,22 @@ mod server {
         // Ephemeral ports always succeed; skip the cancel-retry dance entirely.
         if config.preferred_port == 0 {
             let addr = format!("{}:0", config.host);
+            return tiny_http::Server::http(&addr).map_err(|err| {
+                anyhow!(err).context(format!(
+                    "Failed to bind loopback listener for OAuth callback on {addr}"
+                ))
+            });
+        }
+
+        if !config.cancel_existing {
+            // Keep the advertised localhost spelling, but bind to a literal
+            // loopback address rather than trusting the host resolver.
+            let bind_host = if config.host == "localhost" {
+                "127.0.0.1"
+            } else {
+                config.host
+            };
+            let addr = format!("{}:{}", bind_host, config.preferred_port);
             return tiny_http::Server::http(&addr).map_err(|err| {
                 anyhow!(err).context(format!(
                     "Failed to bind loopback listener for OAuth callback on {addr}"

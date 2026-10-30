@@ -80,6 +80,26 @@ You can connect both local and remote MCP servers from **Settings → AI → MCP
 
 > Note: When a remote MCP server has no configured `"Authorization"` header, Zed will prompt you to authenticate yourself against the MCP server using the standard MCP OAuth flow.
 
+Some OAuth providers require a redirect URI registered in advance. For a remote MCP server using a pre-registered client, configure its exact loopback hostname and port in `settings.json` (the callback path is `/callback`):
+
+```json [settings]
+{
+  "context_servers": {
+    "remote-mcp-server-with-registered-oauth": {
+      "url": "https://mcp.example.com/mcp",
+      "oauth": {
+        "client_id": "your-registered-client-id",
+        "callback_host": "127.0.0.1",
+        "callback_port": 8765,
+        "scopes": ["search:read"]
+      }
+    }
+  }
+}
+```
+
+Register `http://127.0.0.1:8765/callback` with the provider before using this example; use the actual registered hostname, port, client ID, and approved scopes for your app. Only `localhost` and `127.0.0.1` are supported as callback hosts. If the fixed port is unavailable, authentication fails rather than switching to an unregistered port. If `scopes` is set, Zed uses that list rather than scopes advertised by the server; an empty list omits the scope parameter and may allow provider defaults. Without it, Zed uses the scopes supplied by the server. Changing OAuth settings requires a new authorization; previously saved grants with different settings are not reused.
+
 ## Using MCP Servers
 
 ### Configuration Check

@@ -761,6 +761,7 @@ async fn do_oauth_flow(
                 preferred_port: CODEX_CALLBACK_PORT,
                 fallback_port: Some(CODEX_CALLBACK_FALLBACK_PORT),
                 path: CODEX_CALLBACK_PATH,
+                cancel_existing: true,
             },
         )
         .context("Failed to start OAuth callback server")?;

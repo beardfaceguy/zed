@@ -474,6 +474,18 @@ pub struct OAuthClientSettings {
     /// the system keychain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+    /// Exact loopback hostname in the OAuth redirect URI (localhost or 127.0.0.1).
+    /// Defaults to 127.0.0.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_host: Option<String>,
+    /// Fixed loopback port registered for this OAuth client. Defaults to an
+    /// OS-assigned ephemeral port; 0 is not a valid configured value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
+    /// Explicit scopes to request instead of scopes advertised by the server.
+    /// An empty list omits the scope parameter; the provider may grant defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 #[with_fallible_options]
@@ -878,6 +890,32 @@ pub enum GitHostingProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_client_settings_round_trip_redirect_and_scopes() {
+        let configured = r#"{"client_id":"client","callback_host":"localhost","callback_port":8765,"scopes":["search:read","channels:read"]}"#;
+        let oauth: OAuthClientSettings = serde_json::from_str(configured).unwrap();
+        assert_eq!(oauth.callback_host.as_deref(), Some("localhost"));
+        assert_eq!(oauth.callback_port, Some(8765));
+        assert_eq!(
+            oauth.scopes.as_deref(),
+            Some(["search:read".into(), "channels:read".into()].as_slice())
+        );
+        assert_eq!(
+            serde_json::to_value(&oauth).unwrap(),
+            serde_json::from_str::<serde_json::Value>(configured).unwrap()
+        );
+
+        let default: OAuthClientSettings =
+            serde_json::from_str(r#"{"client_id":"client"}"#).unwrap();
+        assert_eq!(default.callback_host, None);
+        assert_eq!(default.callback_port, None);
+        assert_eq!(default.scopes, None);
+        assert_eq!(
+            serde_json::to_string(&default).unwrap(),
+            r#"{"client_id":"client"}"#
+        );
+    }
 
     #[test]
     fn test_stdio_context_server_without_args() {

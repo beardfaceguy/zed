@@ -256,6 +256,9 @@ impl From<settings::ContextServerSettingsContent> for ContextServerSettings {
                 oauth: oauth.map(|o| OAuthClientSettings {
                     client_id: o.client_id,
                     client_secret: o.client_secret,
+                    callback_host: o.callback_host,
+                    callback_port: o.callback_port,
+                    scopes: o.scopes,
                 }),
             },
         }
@@ -296,6 +299,9 @@ impl Into<settings::ContextServerSettingsContent> for ContextServerSettings {
                 oauth: oauth.map(|o| settings::OAuthClientSettings {
                     client_id: o.client_id,
                     client_secret: o.client_secret,
+                    callback_host: o.callback_host,
+                    callback_port: o.callback_port,
+                    scopes: o.scopes,
                 }),
             },
         }
@@ -314,6 +320,12 @@ pub struct OAuthClientSettings {
     /// the system keychain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 impl ContextServerSettings {

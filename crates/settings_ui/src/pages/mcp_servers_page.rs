@@ -734,6 +734,7 @@ pub(crate) struct McpServerForm {
     url: Entity<Editor>,
     timeout: Entity<Editor>,
     oauth_client_id: Entity<Editor>,
+    oauth_settings: Option<OAuthClientSettings>,
     env: Vec<KeyValueRow>,
     headers: Vec<KeyValueRow>,
     error: Option<SharedString>,
@@ -755,6 +756,7 @@ impl McpServerForm {
         let mut url_initial = None;
         let mut timeout_initial = None;
         let mut oauth_initial = None;
+        let mut oauth_settings = None;
         let mut env = Vec::new();
         let mut headers = Vec::new();
 
@@ -788,6 +790,13 @@ impl McpServerForm {
                         headers.push(new_kv_row(Some(&key), Some(&value), window, cx));
                     }
                     oauth_initial = oauth.as_ref().map(|oauth| oauth.client_id.clone());
+                    oauth_settings = oauth.as_ref().map(|oauth| OAuthClientSettings {
+                        client_id: oauth.client_id.clone(),
+                        client_secret: oauth.client_secret.clone(),
+                        callback_host: oauth.callback_host.clone(),
+                        callback_port: oauth.callback_port,
+                        scopes: oauth.scopes.clone(),
+                    });
                 }
                 ContextServerSettings::Extension { .. } => {}
             }
@@ -812,6 +821,7 @@ impl McpServerForm {
                 window,
                 cx,
             ),
+            oauth_settings,
             env,
             headers,
             error: None,
@@ -1202,6 +1212,7 @@ struct McpServerFormValues {
     url: String,
     timeout: String,
     oauth_client_id: String,
+    oauth_settings: Option<OAuthClientSettings>,
     env: Vec<(String, String)>,
     headers: Vec<(String, String)>,
 }
@@ -1226,6 +1237,7 @@ fn build_settings_from_form(
         url: form.url.read(cx).text(cx),
         timeout: form.timeout.read(cx).text(cx),
         oauth_client_id: form.oauth_client_id.read(cx).text(cx),
+        oauth_settings: form.oauth_settings.clone(),
         env: read_kv(&form.env, cx),
         headers: read_kv(&form.headers, cx),
     };
@@ -1291,9 +1303,19 @@ fn build_settings_from_values(
             }
             let headers = collect_kv(&values.headers, "header")?;
             let oauth_client_id = values.oauth_client_id.trim().to_string();
-            let oauth = (!oauth_client_id.is_empty()).then(|| OAuthClientSettings {
-                client_id: oauth_client_id,
-                client_secret: None,
+            let oauth = (!oauth_client_id.is_empty()).then(|| {
+                let mut oauth = values
+                    .oauth_settings
+                    .clone()
+                    .unwrap_or(OAuthClientSettings {
+                        client_id: String::new(),
+                        client_secret: None,
+                        callback_host: None,
+                        callback_port: None,
+                        scopes: None,
+                    });
+                oauth.client_id = oauth_client_id;
+                oauth
             });
             ContextServerSettingsContent::Http {
                 enabled: true,
@@ -1377,6 +1399,7 @@ mod tests {
             url: String::new(),
             timeout: String::new(),
             oauth_client_id: String::new(),
+            oauth_settings: None,
             env: Vec::new(),
             headers: Vec::new(),
         }
@@ -1533,9 +1556,31 @@ mod tests {
                 oauth: Some(OAuthClientSettings {
                     client_id: "client-123".into(),
                     client_secret: None,
+                    callback_host: None,
+                    callback_port: None,
+                    scopes: None,
                 }),
             }
         );
+    }
+
+    #[test]
+    fn saves_existing_remote_oauth_redirect_and_scopes() {
+        let mut values = values(McpTransport::Http);
+        values.url = "https://example.com/mcp".into();
+        values.oauth_client_id = "client".into();
+        values.oauth_settings = Some(OAuthClientSettings {
+            client_id: "client".into(),
+            client_secret: None,
+            callback_host: Some("localhost".into()),
+            callback_port: Some(8765),
+            scopes: Some(vec!["search:read".into()]),
+        });
+        let (_, _, content) = build_settings_from_values(&values).unwrap();
+        let ContextServerSettingsContent::Http { oauth, .. } = content else {
+            panic!("expected HTTP settings");
+        };
+        assert_eq!(oauth, values.oauth_settings);
     }
 
     #[test]

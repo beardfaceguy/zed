@@ -201,6 +201,16 @@ pub struct OAuthDiscovery {
     pub scopes: Vec<String>,
 }
 
+/// Per-server authorization policy recorded with a grant so changed settings
+/// cannot silently reuse a token with broader permissions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthSessionPolicy {
+    pub client_id: String,
+    pub callback_host: Option<String>,
+    pub callback_port: Option<u16>,
+    pub scopes: Option<Vec<String>>,
+}
+
 /// The persisted OAuth session for a context server.
 ///
 /// Stored in the keychain so startup can restore a refresh-capable provider
@@ -212,6 +222,8 @@ pub struct OAuthSession {
     pub resource: Url,
     pub client_registration: OAuthClientRegistration,
     pub tokens: OAuthTokens,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<OAuthSessionPolicy>,
 }
 
 impl std::fmt::Debug for OAuthSession {
@@ -221,6 +233,7 @@ impl std::fmt::Debug for OAuthSession {
             .field("resource", &self.resource)
             .field("client_registration", &self.client_registration)
             .field("tokens", &self.tokens)
+            .field("policy", &self.policy)
             .finish()
     }
 }
@@ -492,6 +505,11 @@ pub fn select_scopes(
         .scopes_supported
         .clone()
         .unwrap_or_default()
+}
+
+/// An explicit per-server scope list takes precedence even when it is empty.
+pub fn requested_scopes(discovered: &[String], configured: Option<&[String]>) -> Vec<String> {
+    configured.unwrap_or(discovered).to_vec()
 }
 
 // -- Client registration strategy --------------------------------------------
@@ -1092,7 +1110,33 @@ impl OAuthCallback {
 /// The callback server shuts down when the returned future is dropped (e.g.
 /// because the authentication task was cancelled), or after a timeout.
 pub fn start_callback_server() -> Result<(String, BoxFuture<'static, Result<OAuthCallback>>)> {
-    let (redirect_uri, rx) = oauth_callback_server::start_oauth_callback_server()?;
+    start_callback_server_with_config(None, None)
+}
+
+/// Use a registered loopback redirect when a server needs an exact OAuth URI.
+pub fn start_callback_server_with_config(
+    callback_host: Option<&str>,
+    callback_port: Option<u16>,
+) -> Result<(String, BoxFuture<'static, Result<OAuthCallback>>)> {
+    let host = match callback_host {
+        None | Some("127.0.0.1") => "127.0.0.1",
+        Some("localhost") => "localhost",
+        Some(_) => bail!("OAuth callback host must be localhost or 127.0.0.1"),
+    };
+    let port = match callback_port {
+        Some(0) => bail!("OAuth callback port must be nonzero"),
+        Some(port) => port,
+        None => 0,
+    };
+    let (redirect_uri, rx) = oauth_callback_server::start_oauth_callback_server_with_config(
+        oauth_callback_server::OAuthCallbackServerConfig {
+            host,
+            preferred_port: port,
+            fallback_port: None,
+            path: "/callback",
+            cancel_existing: false,
+        },
+    )?;
     let future = async move {
         match rx.await {
             Ok(Ok(params)) => Ok(OAuthCallback {
@@ -1602,6 +1646,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_configured_callback_uses_exact_loopback_uri() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let (redirect_uri, callback) =
+            start_callback_server_with_config(Some("127.0.0.1"), Some(port)).unwrap();
+        assert_eq!(redirect_uri, format!("http://127.0.0.1:{port}/callback"));
+        drop(callback);
+    }
+
+    #[test]
+    fn test_localhost_redirect_binds_literal_loopback() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (redirect_uri, callback) =
+            start_callback_server_with_config(Some("localhost"), Some(port)).unwrap();
+        assert_eq!(redirect_uri, format!("http://localhost:{port}/callback"));
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        drop(callback);
+    }
+
+    #[test]
+    fn test_default_callback_still_uses_ephemeral_loopback_port() {
+        let (redirect_uri, callback) = start_callback_server().unwrap();
+        let redirect_uri = Url::parse(&redirect_uri).unwrap();
+        assert_eq!(redirect_uri.host_str(), Some("127.0.0.1"));
+        assert_ne!(redirect_uri.port(), Some(0));
+        assert_eq!(redirect_uri.path(), "/callback");
+        drop(callback);
+    }
+
+    #[test]
+    fn test_registered_callback_fails_if_port_is_busy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = start_callback_server_with_config(Some("127.0.0.1"), Some(port))
+            .err()
+            .expect("registered callback must not fall back");
+        assert!(format!("{err:#}").contains(&port.to_string()));
+    }
+
+    #[test]
+    fn test_registered_callback_rejects_unsafe_host_and_port_zero() {
+        assert!(start_callback_server_with_config(Some("example.com"), Some(8765)).is_err());
+        assert!(start_callback_server_with_config(Some("127.0.0.1"), Some(0)).is_err());
+    }
+
+    #[test]
+    fn test_legacy_session_does_not_match_explicit_oauth_policy() {
+        let stored = serde_json::json!({
+            "token_endpoint": "https://auth.example.com/token",
+            "resource": "https://mcp.example.com/mcp",
+            "client_registration": {"client_id": "client", "client_secret": null},
+            "tokens": {"access_token": "old", "refresh_token": null, "expires_at": null}
+        });
+        let mut session: OAuthSession = serde_json::from_value(stored).unwrap();
+        assert_eq!(session.policy, None);
+        let configured = OAuthSessionPolicy {
+            client_id: "client".into(),
+            callback_host: Some("localhost".into()),
+            callback_port: Some(8765),
+            scopes: Some(vec!["search:read".into()]),
+        };
+        assert_ne!(session.policy.as_ref(), Some(&configured));
+        session.policy = Some(configured.clone());
+        let restored: OAuthSession =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(restored.policy.as_ref(), Some(&configured));
+    }
+
     // -- Scope selection tests -----------------------------------------------
 
     #[test]
@@ -1650,6 +1767,17 @@ mod tests {
             scopes_supported: None,
         };
         assert!(select_scopes(&www_auth, &resource_meta).is_empty());
+    }
+
+    #[test]
+    fn test_explicit_scopes_replace_advertised_write_scopes() {
+        let advertised = vec!["search:read".into(), "chat:write".into()];
+        assert_eq!(
+            requested_scopes(&advertised, Some(&["search:read".into()])),
+            vec!["search:read"]
+        );
+        assert!(requested_scopes(&advertised, Some(&[])).is_empty());
+        assert_eq!(requested_scopes(&advertised, None), advertised);
     }
 
     // -- Client registration strategy tests ----------------------------------
@@ -2718,6 +2846,7 @@ mod tests {
                 refresh_token: refresh_token.map(String::from),
                 expires_at,
             },
+            policy: None,
         }
     }
 

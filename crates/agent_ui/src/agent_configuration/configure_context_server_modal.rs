@@ -298,21 +298,38 @@ fn context_server_http_input(
         },
 
         |oauth| {
-            let mut lines = vec![
-                String::from("\n    \"oauth\": {"),
-
-                format!("      \"client_id\": {},", serde_json::to_string(&oauth.client_id).unwrap()),
-            ];
-            if let Some(client_secret) = oauth.client_secret {
-                lines.push(format!(
+            let mut fields = vec![format!(
+                "      \"client_id\": {}",
+                serde_json::to_string(&oauth.client_id).unwrap()
+            )];
+            if let Some(client_secret) = &oauth.client_secret {
+                fields.push(format!(
                     "      \"client_secret\": {}",
-                    serde_json::to_string(&client_secret).unwrap()
-                ));
-            } else {
-                lines.push(String::from(
-                    "      /// Optional client secret for confidential clients\n      // \"client_secret\": \"your-client-secret\"",
+                    serde_json::to_string(client_secret).unwrap()
                 ));
             }
+            if let Some(callback_host) = &oauth.callback_host {
+                fields.push(format!(
+                    "      \"callback_host\": {}",
+                    serde_json::to_string(callback_host).unwrap()
+                ));
+            }
+            if let Some(callback_port) = oauth.callback_port {
+                fields.push(format!("      \"callback_port\": {callback_port}"));
+            }
+            if let Some(scopes) = &oauth.scopes {
+                fields.push(format!(
+                    "      \"scopes\": {}",
+                    serde_json::to_string(scopes).unwrap()
+                ));
+            }
+            let mut lines = vec![String::from("\n    \"oauth\": {")];
+            if oauth.client_secret.is_none() {
+                lines.push(String::from(
+                    "      /// Optional client secret for confidential clients\n      // \"client_secret\": \"your-client-secret\",",
+                ));
+            }
+            lines.push(fields.join(",\n"));
             lines.push(String::from("    },"));
 
             lines.join("\n")
@@ -1292,6 +1309,32 @@ mod tests {
     }
 
     #[test]
+    fn context_server_http_input_accepts_uncommented_client_secret() {
+        let text = context_server_http_input(Some((
+            ContextServerId("server".into()),
+            String::from("https://mcp.example.com/mcp"),
+            HashMap::default(),
+            Some(OAuthClientSettings {
+                client_id: String::from("client-id"),
+                client_secret: None,
+                callback_host: Some(String::from("localhost")),
+                callback_port: Some(8765),
+                scopes: Some(vec![String::from("search:read")]),
+            }),
+        )));
+        let text = text.replace(
+            "// \"client_secret\": \"your-client-secret\"",
+            "\"client_secret\": \"configured-secret\"",
+        );
+        let (_, _, _, oauth) =
+            parse_http_input(&text).expect("uncommented secret must form valid settings");
+        assert_eq!(
+            oauth.unwrap().client_secret.as_deref(),
+            Some("configured-secret")
+        );
+    }
+
+    #[test]
     fn context_server_http_input_preserves_existing_oauth_settings() {
         let text = context_server_http_input(Some((
             ContextServerId("figma".into()),
@@ -1300,6 +1343,9 @@ mod tests {
             Some(OAuthClientSettings {
                 client_id: String::from("client-id"),
                 client_secret: Some(String::from("client-secret")),
+                callback_host: Some(String::from("localhost")),
+                callback_port: Some(8765),
+                scopes: Some(vec![String::from("search:read")]),
             }),
         )));
 
@@ -1307,5 +1353,26 @@ mod tests {
         let oauth = oauth.expect("oauth should be present");
         assert_eq!(oauth.client_id, "client-id");
         assert_eq!(oauth.client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(oauth.callback_host.as_deref(), Some("localhost"));
+        assert_eq!(oauth.callback_port, Some(8765));
+        assert_eq!(oauth.scopes, Some(vec![String::from("search:read")]));
+
+        let text = context_server_http_input(Some((
+            ContextServerId("figma".into()),
+            String::from("https://mcp.figma.com/mcp"),
+            HashMap::default(),
+            Some(OAuthClientSettings {
+                client_id: String::from("client-id"),
+                client_secret: None,
+                callback_host: Some(String::from("127.0.0.1")),
+                callback_port: Some(8765),
+                scopes: Some(vec![String::from("search:read")]),
+            }),
+        )));
+        let (_, _, _, oauth) = parse_http_input(&text).unwrap();
+        let oauth = oauth.expect("oauth should be present");
+        assert_eq!(oauth.client_secret, None);
+        assert_eq!(oauth.callback_port, Some(8765));
+        assert_eq!(oauth.scopes, Some(vec![String::from("search:read")]));
     }
 }

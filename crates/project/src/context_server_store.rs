@@ -190,6 +190,22 @@ impl ContextServerConfiguration {
         }
     }
 
+    fn oauth_session_policy(&self) -> Option<oauth::OAuthSessionPolicy> {
+        let Self::Http {
+            oauth: Some(settings),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(oauth::OAuthSessionPolicy {
+            client_id: settings.client_id.clone(),
+            callback_host: settings.callback_host.clone(),
+            callback_port: settings.callback_port,
+            scopes: settings.scopes.clone(),
+        })
+    }
+
     pub fn has_static_auth_header(&self) -> bool {
         match self {
             ContextServerConfiguration::Http { headers, .. } => headers
@@ -1126,7 +1142,9 @@ impl ContextServerStore {
                     let http_client = cx.update(|cx| cx.http_client());
 
                     match Self::load_session(&credentials_provider, url, &cx).await {
-                        Ok(Some(session)) => {
+                        Ok(Some(session))
+                            if session.policy == configuration.oauth_session_policy() =>
+                        {
                             log::info!("{} loaded cached OAuth session from keychain", id);
                             Some(Self::create_oauth_token_provider(
                                 &id,
@@ -1136,6 +1154,10 @@ impl ContextServerStore {
                                 credentials_provider,
                                 cx,
                             ))
+                        }
+                        Ok(Some(_)) => {
+                            log::info!("{} OAuth settings changed; ignoring cached session", id);
+                            None
                         }
                         Ok(None) => None,
                         Err(err) => {
@@ -1336,8 +1358,8 @@ impl ContextServerStore {
 
     /// Initiate the OAuth browser flow for a server in the `AuthRequired` state.
     ///
-    /// This starts a loopback HTTP callback server on an ephemeral port, builds
-    /// the authorization URL, opens the user's browser, waits for the callback,
+    /// This starts a loopback HTTP callback server on the configured port (or
+    /// an ephemeral port by default), opens the browser, waits for the callback,
     /// exchanges the code for tokens, persists them in the keychain, and restarts
     /// the server with the new token provider.
     pub fn authenticate_server(
@@ -1573,18 +1595,19 @@ impl ContextServerStore {
         rand::rng().fill(&mut state_bytes);
         let state_param: String = state_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
-        // Start a loopback HTTP server on an ephemeral port. The redirect URI
-        // includes this port so the browser sends the callback directly to our
-        // process.
-        let (redirect_uri, callback_rx) =
-            oauth::start_callback_server().context("Failed to start OAuth callback server")?;
+        let (server_url, oauth_settings) = match configuration.as_ref() {
+            ContextServerConfiguration::Http { url, oauth, .. } => (url.clone(), oauth.as_ref()),
+            _ => anyhow::bail!("OAuth authentication only supported for HTTP servers"),
+        };
+        // A registered redirect must bind exactly; do not fall back to another port.
+        let (redirect_uri, callback_rx) = oauth::start_callback_server_with_config(
+            oauth_settings.and_then(|settings| settings.callback_host.as_deref()),
+            oauth_settings.and_then(|settings| settings.callback_port),
+        )
+        .context("Failed to start OAuth callback server")?;
 
         let http_client = cx.update(|cx| cx.http_client());
         let credentials_provider = cx.update(|cx| zed_credentials_provider::global(cx));
-        let server_url = match configuration.as_ref() {
-            ContextServerConfiguration::Http { url, .. } => url.clone(),
-            _ => anyhow::bail!("OAuth authentication only supported for HTTP servers"),
-        };
 
         let client_registration = match configuration.as_ref() {
             ContextServerConfiguration::Http {
@@ -1615,7 +1638,10 @@ impl ContextServerStore {
             &discovery.auth_server_metadata,
             &client_registration.client_id,
             &redirect_uri,
-            &discovery.scopes,
+            &oauth::requested_scopes(
+                &discovery.scopes,
+                oauth_settings.and_then(|settings| settings.scopes.as_deref()),
+            ),
             &resource,
             &pkce,
             &state_param,
@@ -1649,6 +1675,7 @@ impl ContextServerStore {
             resource: discovery.resource_metadata.resource.clone(),
             client_registration,
             tokens,
+            policy: configuration.oauth_session_policy(),
         };
 
         Self::store_session(&credentials_provider, &server_url, &session, cx)
@@ -2021,7 +2048,7 @@ async fn resolve_start_failure(
 
         let credentials_provider = cx.update(|cx| zed_credentials_provider::global(cx));
         match ContextServerStore::load_session(&credentials_provider, &server_url, cx).await {
-            Ok(Some(_)) => {
+            Ok(Some(session)) if session.policy == configuration.oauth_session_policy() => {
                 log::info!("{id} start failed with a cached OAuth session present; clearing it");
                 ContextServerStore::clear_session(&credentials_provider, &server_url, cx)
                     .await
@@ -2049,6 +2076,46 @@ async fn resolve_start_failure(
         .unwrap_or(&default_www_authenticate);
 
     resolve_auth_required(id, www_authenticate, server, configuration, cx).await
+}
+
+#[cfg(test)]
+mod oauth_policy_tests {
+    use super::*;
+
+    #[test]
+    fn changing_explicit_scopes_or_callback_requires_reauthorization() {
+        let mut configuration = ContextServerConfiguration::Http {
+            url: url::Url::parse("https://mcp.example.com/mcp").unwrap(),
+            headers: HashMap::default(),
+            timeout: None,
+            oauth: Some(OAuthClientSettings {
+                client_id: "client".into(),
+                client_secret: None,
+                callback_host: Some("localhost".into()),
+                callback_port: Some(8765),
+                scopes: Some(vec!["search:read".into()]),
+            }),
+        };
+        let saved_policy = configuration.oauth_session_policy();
+        assert_ne!(saved_policy, None);
+        if let ContextServerConfiguration::Http {
+            oauth: Some(settings),
+            ..
+        } = &mut configuration
+        {
+            settings.scopes = Some(vec!["chat:write".into()]);
+        }
+        assert_ne!(saved_policy, configuration.oauth_session_policy());
+        if let ContextServerConfiguration::Http {
+            oauth: Some(settings),
+            ..
+        } = &mut configuration
+        {
+            settings.scopes = Some(vec!["search:read".into()]);
+            settings.callback_port = Some(8766);
+        }
+        assert_ne!(saved_policy, configuration.oauth_session_policy());
+    }
 }
 
 /// Runs OAuth discovery for a server that returned a 401 and produces the
